@@ -4,27 +4,25 @@ from enum import Enum
 from datetime import datetime
 
 class Industry(str, Enum):
-    TELECOM = "telecom"
-    SAAS = "saas"
-    HEALTHCARE = "healthcare"
-    FINANCE = "finance"
-    RETAIL = "retail"
+    SAAS = "SaaS"
 
 class DocType(str, Enum):
-    SOP = "sop"
-    POLICY = "policy"
-    PROPOSAL = "proposal"
-    SOW = "sow"
-    INCIDENT_REPORT = "incident_report"
-    FAQ = "faq"
-    BUSINESS_CASE = "business_case"
-    SECURITY_POLICY = "security_policy"
-    KPI_REPORT = "kpi_report"
-    RUNBOOK = "runbook"
+    NDA = "NDA"
+    PRIVACY_POLICY = "Privacy Policy"
+    TERMS_OF_SERVICE = "Terms of Service"
+    EMPLOYMENT_CONTRACT = "Employment Contract"
+    SLA = "SLA"
+    BUSINESS_PROPOSAL = "Business Proposal"
+    TECHNICAL_SPEC = "Technical Spec"
+    PROJECT_CHARTER = "Project Charter"
+    RISK_ASSESSMENT = "Risk Assessment"
+    COMPLIANCE_REPORT = "Compliance Report"
+    INVOICE_TEMPLATE = "Invoice Template"
+    PARTNERSHIP_AGREEMENT = "Partnership Agreement"
 
 class DocumentRequest(BaseModel):
     title: str = Field(..., description="Document title")
-    industry: Industry = Field(..., description="Target industry")
+    industry: Industry = Field(default=Industry.SAAS, description="Target industry")
     doc_type: DocType = Field(..., description="Type of document")
     description: Optional[str] = Field(None, description="Brief context or description")
     tags: Optional[List[str]] = Field(default=[], description="Tags for the document")

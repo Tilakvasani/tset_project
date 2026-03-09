@@ -2,8 +2,8 @@ from fastapi import APIRouter, HTTPException
 from backend.schemas.document_schema import DocumentRequest, DocumentResponse
 from backend.schemas.notion_schema import NotionPublishRequest
 from backend.services.generator import generate_document
-from backend.services.notion_service import publish_to_notion
-from backend.services.redis_service import get_cached_doc, cache_doc, get_all_docs
+from backend.services.notion_service import publish_to_notion, get_documents_from_notion
+from backend.services.redis_service import get_cached_doc, cache_doc
 from backend.core.logger import logger
 
 router = APIRouter()
@@ -48,9 +48,10 @@ async def publish(request: NotionPublishRequest):
 
 @router.get("/library")
 async def library():
-    """Get all generated documents from Redis"""
+    """Get all documents from Notion database"""
     try:
-        docs = get_all_docs()
+        docs = await get_documents_from_notion()
         return {"total": len(docs), "documents": docs}
     except Exception as e:
+        logger.error(f"Library fetch failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))

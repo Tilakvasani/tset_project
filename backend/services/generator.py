@@ -17,9 +17,18 @@ def get_model(temperature: float = 0.7):
         api_key=settings.GROQ_API_KEY
     )
 
+def get_value(field) -> str:
+    """Safely extract string value from either enum or plain string"""
+    if hasattr(field, 'value'):
+        return field.value
+    return str(field)
+
 async def generate_document(request: DocumentRequest) -> DocumentResponse:
     """Generate a document using LangChain + Groq"""
-    logger.info(f"Starting generation: {request.doc_type} | {request.industry}")
+    industry_val = get_value(request.industry)
+    doc_type_val = get_value(request.doc_type)
+
+    logger.info(f"Starting generation: {doc_type_val} | {industry_val}")
 
     template_str = get_prompt_template(request.doc_type)
 
@@ -32,10 +41,12 @@ async def generate_document(request: DocumentRequest) -> DocumentResponse:
     model = get_model()
     chain = prompt | model | parser
 
+    description = request.description or f"A professional {doc_type_val} document for the {industry_val} industry"
+
     content = chain.invoke({
         "title": request.title,
-        "industry": request.industry.value,
-        "description": request.description or f"A professional {request.doc_type} document for {request.industry} industry"
+        "industry": industry_val,
+        "description": description
     })
 
     # Quality gate check
@@ -44,17 +55,19 @@ async def generate_document(request: DocumentRequest) -> DocumentResponse:
         logger.warning(f"Quality gate failed: {reason}. Regenerating...")
         content = chain.invoke({
             "title": request.title,
-            "industry": request.industry.value,
-            "description": f"{request.description}. Make sure to include all required sections."
+            "industry": industry_val,
+            "description": f"{description}. Make sure to include all required sections."
         })
+
+    tags = request.tags or [industry_val, doc_type_val]
 
     doc = DocumentModel(
         doc_id=str(uuid.uuid4()),
         title=request.title,
-        industry=request.industry.value,
-        doc_type=request.doc_type.value,
+        industry=industry_val,
+        doc_type=doc_type_val,
         content=content,
-        tags=request.tags or [request.industry.value, request.doc_type.value],
+        tags=tags,
         created_by=request.created_by or "admin",
         created_at=datetime.utcnow(),
     )
