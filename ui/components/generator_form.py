@@ -14,7 +14,7 @@ def render_generator_form():
             st.text_input("Industry", value="SaaS", disabled=True)
         with col2:
             doc_type = st.selectbox("Document Type", [
-                "NDA", "Privacy Policy", "Terms of Service", "Employment Contract",
+                "NDA","SOP", "Privacy Policy", "Terms of Service", "Employment Contract",
                 "SLA", "Business Proposal", "Technical Spec", "Project Charter",
                 "Risk Assessment", "Compliance Report", "Invoice Template",
                 "Partnership Agreement"

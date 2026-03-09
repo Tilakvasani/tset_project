@@ -8,6 +8,7 @@ class Industry(str, Enum):
 
 class DocType(str, Enum):
     NDA = "NDA"
+    SOP="SOP"
     PRIVACY_POLICY = "Privacy Policy"
     TERMS_OF_SERVICE = "Terms of Service"
     EMPLOYMENT_CONTRACT = "Employment Contract"
