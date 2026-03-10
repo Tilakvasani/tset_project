@@ -5,6 +5,7 @@ from backend.core.config import settings
 from backend.core.logger import logger
 from backend.schemas.document_schema import DocumentRequest, DocumentResponse
 from backend.models.document_model import DocumentModel
+from backend.services.db_service import save_document_with_sections
 from prompts.templates import get_prompt_template
 from prompts.quality_gates import check_quality
 from datetime import datetime
@@ -60,9 +61,10 @@ async def generate_document(request: DocumentRequest) -> DocumentResponse:
         })
 
     tags = request.tags or [industry_val, doc_type_val]
+    doc_id = str(uuid.uuid4())
 
     doc = DocumentModel(
-        doc_id=str(uuid.uuid4()),
+        doc_id=doc_id,
         title=request.title,
         industry=industry_val,
         doc_type=doc_type_val,
@@ -72,17 +74,40 @@ async def generate_document(request: DocumentRequest) -> DocumentResponse:
         created_at=datetime.utcnow(),
     )
 
+    # ── Save to PostgreSQL with all 7 section answers ──────────────────
+    answers_dict = {}
+    if request.section_answers:
+        answers_dict = request.section_answers.model_dump()
+
+    try:
+        await save_document_with_sections(
+            doc_id=doc_id,
+            title=request.title,
+            industry=industry_val,
+            department=request.department or "",
+            doc_type=doc_type_val,
+            version=doc.version,
+            content=content,
+            tags=tags,
+            created_by=request.created_by or "admin",
+            answers=answers_dict,
+        )
+    except Exception as db_err:
+        logger.warning(f"PostgreSQL save failed (non-fatal): {db_err}")
+
     logger.info(f"Document generated successfully: {doc.doc_id}")
 
     return DocumentResponse(
         doc_id=doc.doc_id,
         title=doc.title,
         industry=doc.industry,
+        department=request.department,
         doc_type=doc.doc_type,
         content=doc.content,
         tags=doc.tags,
         created_by=doc.created_by,
         created_at=doc.created_at,
         version=doc.version,
-        published=False
+        published=False,
+        section_answers=request.section_answers,
     )

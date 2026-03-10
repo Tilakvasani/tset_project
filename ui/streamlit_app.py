@@ -526,7 +526,7 @@ st.markdown("""
     </p>
     <div class="hero-stats">
         <div class="stat">
-            <span class="stat-n">12</span>
+            <span class="stat-n">13</span>
             <span class="stat-l">Doc Types</span>
         </div>
         <div class="stat">
