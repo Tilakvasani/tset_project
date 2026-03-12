@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     NOTION_API_KEY: str = ""
     NOTION_DATABASE_ID: str = ""
 
+    # PostgreSQL
+    DATABASE_URL: str = "postgresql://postgres:1234@localhost:5432/docforge_db"
+
     # Redis
     REDIS_URL: str = "redis://localhost:6379"
 

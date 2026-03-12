@@ -1,60 +1,136 @@
-from pydantic import BaseModel
-from typing import Optional, List, Dict
-from enum import Enum
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 
-class Department(str, Enum):
-    HR               = "Human Resources (HR)"
-    LEGAL            = "Legal"
-    FINANCE          = "Finance / Accounting"
-    SALES            = "Sales"
-    MARKETING        = "Marketing"
-    ENGINEERING      = "Engineering / Development"
-    PRODUCT          = "Product Management"
-    OPERATIONS       = "Operations"
-    CUSTOMER_SUPPORT = "Customer Support"
-    COMPLIANCE       = "Compliance / Risk Management"
+# ─── Step 1: Load Departments & Doc Types ────────────────────────────────────
+
+class DepartmentResponse(BaseModel):
+    doc_id: int
+    department: str
+    doc_types: List[str]
 
 
-class DocType(str, Enum):
-    TERMS_OF_SERVICE        = "Terms of Service"
-    EMPLOYMENT_CONTRACT     = "Employment Contract"
-    PRIVACY_POLICY          = "Privacy Policy"
-    SOP                     = "SOP"
-    SLA                     = "SLA"
-    PRD                     = "Product Requirement Document"
-    TECHNICAL_SPECIFICATION = "Technical Specification"
-    INCIDENT_REPORT         = "Incident Report"
-    SECURITY_POLICY         = "Security Policy"
-    CUSTOMER_ONBOARDING     = "Customer Onboarding Guide"
-    BUSINESS_PROPOSAL       = "Business Proposal"
-    NDA                     = "NDA"
+# ─── Step 2: Load Sections for a Doc Type ────────────────────────────────────
+
+class SectionResponse(BaseModel):
+    doc_sec_id: int
+    doc_type: str
+    doc_sec: List[str]
 
 
-class DocumentRequest(BaseModel):
-    title:           str
-    industry:        str
-    department:      Optional[str] = None
-    doc_type:        str
-    description:     Optional[str] = None
-    tags:            Optional[List[str]] = None
-    created_by:      Optional[str] = None
-    # Flexible dict — keys depend on doc type (es_q1, sc_q1, pc_q1, etc.)
-    section_answers: Optional[Dict[str, str]] = None
+# ─── Step 3: Generate Questions (LLM) ────────────────────────────────────────
+
+class GenerateQuestionsRequest(BaseModel):
+    doc_sec_id: int                         # FK → document_section
+    doc_id: int                             # FK → depart
+    section_name: str                       # e.g. "Job Position Details"
+    doc_type: str                           # e.g. "Employee Offer Letter"
+    department: str                         # e.g. "HR"
+    company_context: Optional[Dict[str, str]] = Field(
+        default={},
+        description="Company name, industry, size, region"
+    )
+
+class GenerateQuestionsResponse(BaseModel):
+    sec_id: int                             # PK from section_que_ans
+    doc_sec_id: int
+    doc_id: int
+    section_name: str
+    questions: List[str]                    # LLM-generated questions
 
 
-class DocumentResponse(BaseModel):
-    doc_id:          str
-    title:           str
-    industry:        str
-    department:      Optional[str] = None
-    doc_type:        str
-    content:         str
-    tags:            Optional[List[str]] = None
-    created_by:      Optional[str] = None
-    created_at:      datetime
-    version:         str = "1.0"
-    notion_url:      Optional[str] = None
-    published:       bool = False
-    section_answers: Optional[Dict[str, str]] = None
+# ─── Step 4: Save User Answers ────────────────────────────────────────────────
+
+class SaveAnswersRequest(BaseModel):
+    sec_id: int                             # FK → section_que_ans
+    doc_sec_id: int
+    doc_id: int
+    section_name: str
+    questions: List[str]
+    answers: List[str]
+
+
+class SaveAnswersResponse(BaseModel):
+    sec_id: int
+    section_name: str
+    saved: bool
+
+
+# ─── Step 5: Generate Section Content (LLM) ──────────────────────────────────
+
+class GenerateSectionRequest(BaseModel):
+    sec_id: int                             # FK → section_que_ans
+    doc_sec_id: int
+    doc_id: int
+    section_name: str
+    doc_type: str
+    department: str
+    company_context: Optional[Dict[str, str]] = {}
+
+
+class GenerateSectionResponse(BaseModel):
+    sec_id: int
+    section_name: str
+    content: str                            # Generated markdown prose
+
+
+# ─── Step 6: Combine Sections → Full Document ────────────────────────────────
+
+class CombineDocumentRequest(BaseModel):
+    doc_id: int
+    doc_sec_id: int
+    doc_type: str
+    department: str
+    sec_ids: List[int]                      # All section sec_ids in order
+    company_context: Optional[Dict[str, str]] = {}
+
+
+class CombineDocumentResponse(BaseModel):
+    gen_id: int                             # PK from gen_doc
+    doc_id: int
+    doc_sec_id: int
+    doc_type: str
+    department: str
+    gen_doc_sec_dec: List[str]              # Section content list
+    gen_doc_full: str                       # Full assembled document
+
+
+# ─── Step 7: Edit / Enhance a Section ────────────────────────────────────────
+
+class EditSectionRequest(BaseModel):
+    gen_id: int                             # FK → gen_doc
+    sec_id: int
+    section_name: str
+    current_content: str
+    edit_instruction: str                   # e.g. "Make it more formal"
+
+
+class EditSectionResponse(BaseModel):
+    sec_id: int
+    section_name: str
+    updated_content: str
+
+
+# ─── Step 8: Publish to Notion ───────────────────────────────────────────────
+
+class NotionPublishRequest(BaseModel):
+    gen_id: int
+    doc_type: str
+    department: str
+    gen_doc_full: str
+    company_context: Optional[Dict[str, str]] = {}
+
+
+class NotionPublishResponse(BaseModel):
+    notion_url: str
+    notion_page_id: str
+
+
+# ─── Step 9: Download ────────────────────────────────────────────────────────
+
+class DownloadRequest(BaseModel):
+    gen_id: int
+    format: str = Field(..., description="pdf or docx")
+    gen_doc_full: str
+    doc_type: str

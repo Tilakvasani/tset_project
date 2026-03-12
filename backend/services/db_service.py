@@ -1,175 +1,261 @@
 """
-backend/services/db_service.py
-
-Saves to PostgreSQL:
-  - documents       → 1 row (full doc + metadata)
-  - document_sections → 1 row (all 7 sections, 14 answers, flat columns)
-
-Install:  pip install asyncpg
-.env:     DATABASE_URL=postgresql://postgres:yourpassword@localhost:5432/docforge_db
+DocForge AI — db_service.py
+All PostgreSQL operations for the full workflow.
+Tables: depart · document_section · section_que_ans · gen_doc
 """
-
+import json
 import asyncpg
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from backend.core.config import settings
 from backend.core.logger import logger
 
 
-async def get_connection() -> asyncpg.Connection:
-    return await asyncpg.connect(settings.DATABASE_URL)
+# ─── Connection Pool ──────────────────────────────────────────────────────────
 
+_pool: Optional[asyncpg.Pool] = None
 
-async def save_document_with_sections(
-    doc_id: str,
-    title: str,
-    industry: str,
-    department: str,
-    doc_type: str,
-    version: str,
-    content: str,
-    tags: list,
-    created_by: str,
-    answers: dict,          # gen_answers dict from Streamlit session_state
-    template_id: str = None,
-) -> str:
-    """
-    Saves 1 row to documents + 1 row to document_sections.
-    answers keys must match generator_form.py session_state keys:
-        s1: doc_title, doc_version
-        s2: purpose_main, purpose_problem
-        s3: scope_applies, scope_exclusions
-        s4: resp_implement, resp_maintain
-        s5: proc_steps, proc_tools
-        s6: comp_regs, comp_risks
-        s7: conc_outcome, conc_review
-    """
-    word_count = len(content.split())
-    conn = await get_connection()
-
-    try:
-        async with conn.transaction():
-
-            # ── INSERT into documents ────────────────────────────
-            await conn.execute("""
-                INSERT INTO documents (
-                    id, title, industry, department, doc_type,
-                    version, content, word_count, tags,
-                    created_by, status, published, template_id
-                ) VALUES (
-                    $1, $2, $3, $4, $5,
-                    $6, $7, $8, $9::text[],
-                    $10, 'Generated', FALSE, $11
-                )
-            """,
-                doc_id, title, industry, department, doc_type,
-                version, content, word_count, tags,
-                created_by, template_id
-            )
-
-            # ── INSERT into document_sections (ONE flat row) ─────
-            await conn.execute("""
-                INSERT INTO document_sections (
-                    document_id,
-
-                    s1_answer_1, s1_answer_2,
-                    s2_answer_1, s2_answer_2,
-                    s3_answer_1, s3_answer_2,
-                    s4_answer_1, s4_answer_2,
-                    s5_answer_1, s5_answer_2,
-                    s6_answer_1, s6_answer_2,
-                    s7_answer_1, s7_answer_2
-                ) VALUES (
-                    $1,
-                    $2,  $3,
-                    $4,  $5,
-                    $6,  $7,
-                    $8,  $9,
-                    $10, $11,
-                    $12, $13,
-                    $14, $15
-                )
-            """,
-                doc_id,
-                answers.get("doc_title", ""),        answers.get("doc_version", ""),
-                answers.get("purpose_main", ""),     answers.get("purpose_problem", ""),
-                answers.get("scope_applies", ""),    answers.get("scope_exclusions", ""),
-                answers.get("resp_implement", ""),   answers.get("resp_maintain", ""),
-                answers.get("proc_steps", ""),       answers.get("proc_tools", ""),
-                answers.get("comp_regs", ""),        answers.get("comp_risks", ""),
-                answers.get("conc_outcome", ""),     answers.get("conc_review", ""),
-            )
-
-        logger.info(f"✅ Saved doc {doc_id} to PostgreSQL (documents + document_sections)")
-        return doc_id
-
-    except Exception as e:
-        logger.error(f"❌ DB save failed: {e}")
-        raise
-    finally:
-        await conn.close()
-
-
-async def update_notion_url(doc_id: str, notion_url: str, notion_page_id: str):
-    """Called after Notion publish — stamps notion_url + published=TRUE."""
-    conn = await get_connection()
-    try:
-        await conn.execute("""
-            UPDATE documents
-            SET notion_url     = $1,
-                notion_page_id = $2,
-                published      = TRUE
-            WHERE id = $3
-        """, notion_url, notion_page_id, doc_id)
-        logger.info(f"✅ Updated notion_url for doc {doc_id}")
-    finally:
-        await conn.close()
-
-
-async def get_document_with_sections(doc_id: str) -> Optional[dict]:
-    """Fetch one document + its sections via the v_documents_full view."""
-    conn = await get_connection()
-    try:
-        row = await conn.fetchrow(
-            "SELECT * FROM v_documents_full WHERE id = $1", doc_id
+async def get_pool() -> asyncpg.Pool:
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(
+            dsn=settings.DATABASE_URL,
+            min_size=2,
+            max_size=10
         )
-        return dict(row) if row else None
-    finally:
-        await conn.close()
+        logger.info("PostgreSQL connection pool created")
+    return _pool
 
 
-async def get_all_documents(
-    department: str = None,
-    doc_type: str = None,
-    status: str = None,
-    limit: int = 50,
-) -> list:
-    """Fetch all documents with optional filters."""
-    conn = await get_connection()
-    try:
-        conditions = []
-        params = []
-        i = 1
+async def close_pool():
+    global _pool
+    if _pool:
+        await _pool.close()
+        _pool = None
+        logger.info("PostgreSQL connection pool closed")
 
-        if department:
-            conditions.append(f"department = ${i}"); params.append(department); i += 1
-        if doc_type:
-            conditions.append(f"doc_type = ${i}"); params.append(doc_type); i += 1
-        if status:
-            conditions.append(f"status = ${i}"); params.append(status); i += 1
 
-        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-        params.append(limit)
+# ─── TABLE: depart ────────────────────────────────────────────────────────────
 
-        rows = await conn.fetch(f"""
-            SELECT id, doc_number, title, department, doc_type,
-                   version, word_count, tags, created_by,
-                   status, published, notion_url, created_at
-            FROM documents
-            {where}
-            ORDER BY created_at DESC
-            LIMIT ${i}
-        """, *params)
+async def get_all_departments() -> List[Dict]:
+    """Load all departments and their doc types."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT doc_id, department, doc_types FROM depart ORDER BY doc_id"
+        )
+    return [dict(r) for r in rows]
 
-        return [dict(r) for r in rows]
-    finally:
-        await conn.close()
+
+async def get_department_by_id(doc_id: int) -> Optional[Dict]:
+    """Get a single department row."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT doc_id, department, doc_types FROM depart WHERE doc_id = $1",
+            doc_id
+        )
+    return dict(row) if row else None
+
+
+# ─── TABLE: document_section ─────────────────────────────────────────────────
+
+async def get_sections_by_doc_type(doc_type: str) -> Optional[Dict]:
+    """Get sections for a given document type."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT doc_sec_id, doc_type, doc_sec FROM document_section WHERE doc_type = $1",
+            doc_type
+        )
+    return dict(row) if row else None
+
+
+async def get_sections_by_id(doc_sec_id: int) -> Optional[Dict]:
+    """Get document_section row by primary key."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT doc_sec_id, doc_type, doc_sec FROM document_section WHERE doc_sec_id = $1",
+            doc_sec_id
+        )
+    return dict(row) if row else None
+
+
+# ─── TABLE: section_que_ans ──────────────────────────────────────────────────
+
+async def save_questions(
+    doc_sec_id: int,
+    doc_id: int,
+    section_name: str,
+    questions: List[str]
+) -> int:
+    """
+    Insert a new row into section_que_ans with generated questions.
+    Returns the new sec_id (SERIAL PK).
+    """
+    pool = await get_pool()
+    qa_data = json.dumps({
+        "section_name": section_name,
+        "questions": questions,
+        "answers": []          # Answers filled in next step
+    })
+    async with pool.acquire() as conn:
+        sec_id = await conn.fetchval(
+            """
+            INSERT INTO section_que_ans (doc_sec_id, doc_id, doc_sec_que_ans)
+            VALUES ($1, $2, $3::jsonb)
+            RETURNING sec_id
+            """,
+            doc_sec_id, doc_id, qa_data
+        )
+    logger.info(f"Questions saved: sec_id={sec_id}, section={section_name}")
+    return sec_id
+
+
+async def save_answers(
+    sec_id: int,
+    questions: List[str],
+    answers: List[str],
+    section_name: str
+) -> bool:
+    """
+    Update section_que_ans with user answers.
+    """
+    pool = await get_pool()
+    qa_data = json.dumps({
+        "section_name": section_name,
+        "questions": questions,
+        "answers": answers
+    })
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE section_que_ans
+            SET doc_sec_que_ans = $1::jsonb
+            WHERE sec_id = $2
+            """,
+            qa_data, sec_id
+        )
+    logger.info(f"Answers saved: sec_id={sec_id}")
+    return True
+
+
+async def get_qa_by_sec_id(sec_id: int) -> Optional[Dict]:
+    """Fetch the full Q&A row for a section."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT sec_id, doc_sec_id, doc_id, doc_sec_que_ans
+            FROM section_que_ans
+            WHERE sec_id = $1
+            """,
+            sec_id
+        )
+    if not row:
+        return None
+    result = dict(row)
+    # Parse JSONB
+    if isinstance(result["doc_sec_que_ans"], str):
+        result["doc_sec_que_ans"] = json.loads(result["doc_sec_que_ans"])
+    return result
+
+
+async def get_all_qa_for_document(doc_sec_id: int, doc_id: int) -> List[Dict]:
+    """Fetch all Q&A rows for a full document (all sections)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT sec_id, doc_sec_id, doc_id, doc_sec_que_ans
+            FROM section_que_ans
+            WHERE doc_sec_id = $1 AND doc_id = $2
+            ORDER BY sec_id
+            """,
+            doc_sec_id, doc_id
+        )
+    result = []
+    for row in rows:
+        r = dict(row)
+        if isinstance(r["doc_sec_que_ans"], str):
+            r["doc_sec_que_ans"] = json.loads(r["doc_sec_que_ans"])
+        result.append(r)
+    return result
+
+
+# ─── TABLE: gen_doc ───────────────────────────────────────────────────────────
+
+async def save_generated_document(
+    doc_id: int,
+    doc_sec_id: int,
+    sec_id: int,
+    gen_doc_sec_dec: List[str],
+    gen_doc_full: str
+) -> int:
+    """
+    Insert a generated document into gen_doc.
+    Returns the new gen_id (SERIAL PK).
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        gen_id = await conn.fetchval(
+            """
+            INSERT INTO gen_doc (doc_id, doc_sec_id, sec_id, gen_doc_sec_dec, gen_doc_full)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING gen_id
+            """,
+            doc_id, doc_sec_id, sec_id,
+            gen_doc_sec_dec,
+            gen_doc_full
+        )
+    logger.info(f"Document saved: gen_id={gen_id}")
+    return gen_id
+
+
+async def update_section_content(gen_id: int, updated_sections: List[str], full_doc: str) -> bool:
+    """Update gen_doc after section edit/enhance."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE gen_doc
+            SET gen_doc_sec_dec = $1,
+                gen_doc_full = $2
+            WHERE gen_id = $3
+            """,
+            updated_sections, full_doc, gen_id
+        )
+    logger.info(f"Document updated: gen_id={gen_id}")
+    return True
+
+
+async def get_generated_document(gen_id: int) -> Optional[Dict]:
+    """Fetch a generated document by gen_id."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT gen_id, doc_id, doc_sec_id, sec_id,
+                   gen_doc_sec_dec, gen_doc_full
+            FROM gen_doc
+            WHERE gen_id = $1
+            """,
+            gen_id
+        )
+    return dict(row) if row else None
+
+
+async def get_all_generated_documents(doc_id: Optional[int] = None) -> List[Dict]:
+    """Fetch all generated documents, optionally filtered by department doc_id."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if doc_id:
+            rows = await conn.fetch(
+                "SELECT gen_id, doc_id, doc_sec_id, sec_id, gen_doc_full FROM gen_doc WHERE doc_id = $1 ORDER BY gen_id DESC",
+                doc_id
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT gen_id, doc_id, doc_sec_id, sec_id, gen_doc_full FROM gen_doc ORDER BY gen_id DESC"
+            )
+    return [dict(r) for r in rows]
