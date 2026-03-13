@@ -1,4 +1,3 @@
-import pytest
 from backend.schemas.notion_schema import NotionPublishRequest
 
 def test_notion_schema_valid():
