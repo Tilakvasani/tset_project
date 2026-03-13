@@ -1,10 +1,9 @@
 """
-DocForge AI — generator.py  v4.0
-- Azure OpenAI GPT-4.1-mini (replaces Groq)
-- Industry-standard document lengths
-- Smart table detection — sections that need tables get them
-- Plain text output (tables rendered as ASCII/text grids)
-- Smart question count 0-3
+DocForge AI — generator.py  v5.1
+- Text sections: LLM generates 0-3 questions, user answers, LLM writes plain text
+- Table sections: LLM generates 1-3 questions about the table data,
+  user answers in normal text areas, LLM builds a pipe-format table from answers
+- No special column/row UI — same answer flow for all sections
 """
 import re
 from langchain_openai import AzureChatOpenAI
@@ -35,9 +34,14 @@ def get_llm(temperature: float = 0.7) -> AzureChatOpenAI:
     )
 
 
-# ─── Smart Question Generation (0-3) ─────────────────────────────────────────
+def _needs_table(doc_type: str, section_name: str) -> bool:
+    key = f"{doc_type}|{section_name}".lower()
+    return any(p.lower() in key for p in SECTIONS_NEEDING_TABLES)
 
-SMART_QUESTION_PROMPT = PromptTemplate(
+
+# ─── Question Generation ──────────────────────────────────────────────────────
+
+TEXT_QUESTIONS_PROMPT = PromptTemplate(
     input_variables=["section_name", "doc_type", "department",
                      "company_name", "industry", "company_size", "region"],
     template="""You are an expert enterprise documentation specialist.
@@ -50,7 +54,7 @@ Section: {section_name}
 Company: {company_name} | Industry: {industry}
 
 Rules:
-- 0 questions: Purely structural — signature blocks, document title, date stamps, version stamps, header metadata. Respond: NONE
+- 0 questions: Purely structural — signature blocks, date stamps, version stamps. Respond: NONE
 - 1 question: Simple single-value — one date, one name, one role
 - 2 questions: Needs 2 distinct pieces of context
 - 3 questions: Complex section needing multiple details (maximum)
@@ -62,19 +66,53 @@ Output:
 Respond now:"""
 )
 
+TABLE_QUESTIONS_PROMPT = PromptTemplate(
+    input_variables=["section_name", "doc_type", "department", "company_name", "industry"],
+    template="""You are an expert enterprise documentation specialist.
+
+This section will contain a data table. Write 1-3 questions to collect the table data from the user.
+
+Document Type: {doc_type}
+Department: {department}
+Section: {section_name}
+Company: {company_name} | Industry: {industry}
+
+Rules:
+- Ask for the actual row data that should go in the table
+- Questions should be clear and specific about what data to provide
+- Example for "Commission Earned per Deal":
+  "List each deal with: deal name, amount, commission rate, and commission earned (one deal per line)"
+- Maximum 3 questions
+- One question per line, no numbering, no extra text
+
+Respond now:"""
+)
+
 
 async def generate_questions(req: GenerateQuestionsRequest) -> dict:
-    ctx = req.company_context or {}
-    chain = SMART_QUESTION_PROMPT | get_llm(0.3) | StrOutputParser()
+    ctx      = req.company_context or {}
+    is_table = _needs_table(req.doc_type, req.section_name)
 
-    raw = chain.invoke({
-        "section_name": req.section_name, "doc_type": req.doc_type,
-        "department":   req.department,
-        "company_name": ctx.get("company_name", "the company"),
-        "industry":     ctx.get("industry", "general"),
-        "company_size": ctx.get("company_size", "not specified"),
-        "region":       ctx.get("region", "not specified"),
-    }).strip()
+    if is_table:
+        chain = TABLE_QUESTIONS_PROMPT | get_llm(0.3) | StrOutputParser()
+        raw   = chain.invoke({
+            "section_name": req.section_name,
+            "doc_type":     req.doc_type,
+            "department":   req.department,
+            "company_name": ctx.get("company_name", "the company"),
+            "industry":     ctx.get("industry", "general"),
+        }).strip()
+    else:
+        chain = TEXT_QUESTIONS_PROMPT | get_llm(0.3) | StrOutputParser()
+        raw   = chain.invoke({
+            "section_name": req.section_name,
+            "doc_type":     req.doc_type,
+            "department":   req.department,
+            "company_name": ctx.get("company_name", "the company"),
+            "industry":     ctx.get("industry", "general"),
+            "company_size": ctx.get("company_size", "not specified"),
+            "region":       ctx.get("region", "not specified"),
+        }).strip()
 
     questions = [] if (not raw or raw.upper() == "NONE") else [
         q.strip() for q in raw.split("\n") if q.strip()
@@ -84,9 +122,15 @@ async def generate_questions(req: GenerateQuestionsRequest) -> dict:
         doc_sec_id=req.doc_sec_id, doc_id=req.doc_id,
         section_name=req.section_name, questions=questions
     )
-    logger.info(f"Questions: {len(questions)} for '{req.section_name}' sec_id={sec_id}")
-    return {"sec_id": sec_id, "doc_sec_id": req.doc_sec_id, "doc_id": req.doc_id,
-            "section_name": req.section_name, "questions": questions}
+    logger.info(f"{'Table' if is_table else 'Text'} questions: {len(questions)} for '{req.section_name}'")
+    return {
+        "sec_id":       sec_id,
+        "doc_sec_id":   req.doc_sec_id,
+        "doc_id":       req.doc_id,
+        "section_name": req.section_name,
+        "questions":    questions,
+        "is_table":     is_table,
+    }
 
 
 # ─── Save Answers ─────────────────────────────────────────────────────────────
@@ -99,8 +143,7 @@ async def save_user_answers(req: SaveAnswersRequest) -> dict:
     return {"sec_id": req.sec_id, "section_name": req.section_name, "saved": True}
 
 
-# ─── Generate Section Content ─────────────────────────────────────────────────
-# Two prompts: one for plain text sections, one for table sections
+# ─── Section Content Prompts ──────────────────────────────────────────────────
 
 SECTION_TEXT_PROMPT = PromptTemplate(
     input_variables=["doc_type", "department", "section_name", "company_name",
@@ -115,7 +158,7 @@ User answers:
 {qa_block}
 
 STRICT RULES:
-1. Write EXACTLY {target_words} words — this is a hard limit, do NOT exceed it
+1. Write EXACTLY {target_words} words — hard limit, do NOT exceed
 2. PLAIN TEXT ONLY — zero markdown, no asterisks, no # symbols, no backticks
 3. Regular paragraphs separated by blank lines
 4. Lists: use "1. Item" or "- Item" only
@@ -128,40 +171,36 @@ Write now:"""
 
 SECTION_TABLE_PROMPT = PromptTemplate(
     input_variables=["doc_type", "department", "section_name", "company_name",
-                     "industry", "company_size", "region", "qa_block", "target_words"],
+                     "industry", "region", "qa_block"],
     template="""You are a professional enterprise documentation writer.
 
-Write the "{section_name}" section of a {doc_type}. This section REQUIRES a data table.
+Write the "{section_name}" section of a {doc_type}. This section MUST contain a data table.
 
 Company: {company_name} | Dept: {department} | Industry: {industry} | Region: {region}
 
-User answers:
+User-provided data:
 {qa_block}
 
-STRICT RULES:
-1. Write EXACTLY {target_words} words total — hard limit, do NOT exceed
-2. Start with 1-2 sentences of plain text introduction
-3. Then include a TABLE formatted EXACTLY like this — pipe-separated, no extra spaces:
+OUTPUT FORMAT — follow this EXACTLY:
+1. One sentence of plain text introduction (no markdown)
+2. A blank line
+3. A pipe-format table using the user's data:
+
    Column1 | Column2 | Column3
    ------- | ------- | -------
-   Value1  | Value2  | Value3
-4. After the table, add 1-2 sentences of plain text summary/notes if needed
-5. NO other markdown — no **, no ##, no backticks — ONLY the table uses pipes and dashes
-6. Table must have realistic industry-standard data for a {doc_type}
-7. "not answered" = use realistic professional placeholder values
-8. No section heading in output
+   value1  | value2  | value3
+   value2  | value2  | value3
+
+STRICT RULES:
+- Use the user's data to populate the table rows
+- If user said "not answered" or gave no data, create an empty table with appropriate columns for {section_name} of a {doc_type}
+- Table columns must be industry-standard for this section type
+- NO markdown outside the table — no **, no ##, no backticks
+- The intro sentence goes BEFORE the table, never inside a cell
+- No section heading
 
 Write now:"""
 )
-
-
-def _needs_table(doc_type: str, section_name: str) -> bool:
-    """Check if this doc_type+section combination should have a table."""
-    key = f"{doc_type}|{section_name}".lower()
-    for pattern in SECTIONS_NEEDING_TABLES:
-        if pattern.lower() in key:
-            return True
-    return False
 
 
 async def generate_section_content(req: GenerateSectionRequest) -> dict:
@@ -171,69 +210,62 @@ async def generate_section_content(req: GenerateSectionRequest) -> dict:
 
     qa_data   = qa_row["doc_sec_que_ans"]
     questions = qa_data.get("questions", [])
-    answers   = qa_data.get("answers", [])
+    answers   = qa_data.get("answers",   [])
+    is_table  = _needs_table(req.doc_type, req.section_name)
+    ctx       = req.company_context or {}
 
     qa_block = (
-        "No specific questions — write professional standard content."
+        "No specific input — use professional placeholder content."
         if not questions else
         "\n".join(f"Q: {q}\nA: {a}\n" for q, a in zip(questions, answers))
     )
 
-    target_words = get_words_per_section(req.doc_type, req.num_sections or 10)
-    ctx   = req.company_context or {}
-    needs_table = _needs_table(req.doc_type, req.section_name)
+    if is_table:
+        chain = SECTION_TABLE_PROMPT | get_llm(0.5) | StrOutputParser()
+        raw   = chain.invoke({
+            "doc_type":     req.doc_type,
+            "department":   req.department,
+            "section_name": req.section_name,
+            "company_name": ctx.get("company_name", "the company"),
+            "industry":     ctx.get("industry", "general"),
+            "region":       ctx.get("region", "not specified"),
+            "qa_block":     qa_block,
+        })
+        clean = _clean_preserve_tables(raw.strip())
+        logger.info(f"Table section '{req.section_name}' generated")
 
-    prompt = SECTION_TABLE_PROMPT if needs_table else SECTION_TEXT_PROMPT
-    chain  = prompt | get_llm(0.7) | StrOutputParser()
+    else:
+        target_words = get_words_per_section(req.doc_type, req.num_sections or 10)
+        chain = SECTION_TEXT_PROMPT | get_llm(0.7) | StrOutputParser()
+        raw   = chain.invoke({
+            "doc_type":     req.doc_type,
+            "department":   req.department,
+            "section_name": req.section_name,
+            "company_name": ctx.get("company_name", "the company"),
+            "industry":     ctx.get("industry", "general"),
+            "company_size": ctx.get("company_size", "not specified"),
+            "region":       ctx.get("region", "not specified"),
+            "qa_block":     qa_block,
+            "target_words": target_words,
+        })
+        clean = _clean_preserve_tables(raw.strip())
 
-    raw = chain.invoke({
-        "doc_type":     req.doc_type,
-        "department":   req.department,
-        "section_name": req.section_name,
-        "company_name": ctx.get("company_name", "the company"),
-        "industry":     ctx.get("industry", "general"),
-        "company_size": ctx.get("company_size", "not specified"),
-        "region":       ctx.get("region", "not specified"),
-        "qa_block":     qa_block,
-        "target_words": target_words,
-    })
+        # Hard word limit
+        words = clean.split()
+        if len(words) > target_words * 1.2:
+            truncated   = " ".join(words[:target_words])
+            last_period = max(truncated.rfind('.'), truncated.rfind('!'), truncated.rfind('?'))
+            clean = truncated[:last_period + 1].strip() if last_period > len(truncated) * 0.6 else truncated
 
-    # Strip markdown, preserve tables
-    clean = _clean_preserve_tables(raw.strip())
+        logger.info(f"Text section '{req.section_name}' — {len(clean.split())} words")
 
-    # Hard enforce word limit — truncate at sentence boundary if LLM overshoots by >20%
-    words = clean.split()
-    if len(words) > target_words * 1.2:
-        # Cut to target_words, then extend to next sentence end
-        truncated = " ".join(words[:target_words])
-        last_period = max(truncated.rfind('.'), truncated.rfind('!'), truncated.rfind('?'))
-        if last_period > len(truncated) * 0.6:
-            clean = truncated[:last_period + 1].strip()
-        else:
-            clean = truncated.strip()
-
-    logger.info(f"Generated section '{req.section_name}' ({len(clean.split())} words, table={needs_table})")
     return {"sec_id": req.sec_id, "section_name": req.section_name, "content": clean}
 
 
 def _clean_preserve_tables(text: str) -> str:
-    """
-    Strip markdown from text but preserve table lines (lines containing |).
-    Table lines are kept as-is for the docx builder to detect and render as Word tables.
-    """
-    lines = text.split('\n')
-    result = []
-    for line in lines:
-        # Preserve table rows and separator rows exactly
-        if '|' in line:
-            result.append(line.rstrip())
-        else:
-            # Apply full markdown stripping to non-table lines
-            clean = markdown_to_plain_text(line)
-            result.append(clean)
-    out = '\n'.join(result)
-    out = re.sub(r'\n{3,}', '\n\n', out)
-    return out.strip()
+    lines  = text.split('\n')
+    result = [line.rstrip() if '|' in line else markdown_to_plain_text(line) for line in lines]
+    return re.sub(r'\n{3,}', '\n\n', '\n'.join(result)).strip()
 
 
 # ─── Edit Section ─────────────────────────────────────────────────────────────
@@ -248,9 +280,8 @@ Current Content:
 
 Instruction: {edit_instruction}
 
-Apply the instruction. Professional tone.
 PLAIN TEXT ONLY — no markdown, no asterisks, no # symbols.
-If a table exists, keep it in pipe format.
+If a pipe-format table exists, keep it exactly in pipe format.
 Return ONLY the updated content:"""
 )
 
