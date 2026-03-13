@@ -330,7 +330,10 @@ elif st.session_state.step == 2:
                     "company_context": st.session_state.company_ctx})
                 if res:
                     st.session_state.section_questions[sec] = {
-                        "sec_id": res["sec_id"], "questions": res["questions"]}
+                        "sec_id": res["sec_id"],
+                        "questions": res["questions"],
+                        "is_table": res.get("is_table", False),
+                    }
                 bar.progress((i+1)/total)
             status.markdown("✅ Done!"); st.rerun()
 
@@ -377,42 +380,115 @@ elif st.session_state.step == 3:
         st.markdown("---")
         st.markdown(f"### 📌 {current}")
 
-        q_data    = q_map.get(current, {})
+        q_data   = q_map.get(current, {})
         questions = q_data.get("questions", [])
         sec_id    = q_data.get("sec_id")
+        is_table  = q_data.get("is_table", False)
 
-        user_answers = []
-        if not questions:
-            st.info("No questions for this section — content will be auto-generated.")
+        # ── TABLE SECTION: user enters row data ──────────────────────────────
+        if is_table:
+            columns = questions  # LLM-generated column headers
+            if columns:
+                st.info(f"📊 This section requires a table. Enter your data below.\n\n"
+                        f"**Columns:** {' | '.join(columns)}")
+                st.markdown("*Add as many rows as needed. Leave empty to use a blank table.*")
+
+                # Dynamic row count in session state
+                row_key = f"table_rows_{current}"
+                if row_key not in st.session_state:
+                    st.session_state[row_key] = 1
+
+                # Render rows
+                all_rows = []
+                for r in range(st.session_state[row_key]):
+                    st.markdown(f"**Row {r+1}**")
+                    row_cols = st.columns(len(columns))
+                    row_vals = []
+                    for ci, col_name in enumerate(columns):
+                        val = row_cols[ci].text_input(
+                            col_name, key=f"cell_{current}_{r}_{ci}",
+                            label_visibility="visible")
+                        row_vals.append(val)
+                    all_rows.append(row_vals)
+
+                ca, cb = st.columns([1, 3])
+                with ca:
+                    if st.button("➕ Add Row", use_container_width=True):
+                        st.session_state[row_key] += 1
+                        st.rerun()
+                with cb:
+                    if st.session_state[row_key] > 1:
+                        if st.button("➖ Remove Last Row", use_container_width=True):
+                            st.session_state[row_key] -= 1
+                            st.rerun()
+
+                st.markdown("---")
+                c1, c2 = st.columns([1, 3])
+                with c1:
+                    if st.button("⏭️ Skip (empty table)", use_container_width=True):
+                        import json
+                        if sec_id:
+                            api_post("/answers/save", {
+                                "sec_id": sec_id,
+                                "doc_sec_id": st.session_state.doc_sec_id,
+                                "doc_id": st.session_state.selected_dept_id,
+                                "section_name": current,
+                                "questions": columns,
+                                "answers": [json.dumps([])]})
+                        st.session_state.section_answers[current] = [json.dumps([])]
+                        st.rerun()
+                with c2:
+                    if st.button("💾 Save Table & Next →", type="primary", use_container_width=True):
+                        import json
+                        # Filter out fully empty rows
+                        filled_rows = [r for r in all_rows if any(v.strip() for v in r)]
+                        if sec_id:
+                            api_post("/answers/save", {
+                                "sec_id": sec_id,
+                                "doc_sec_id": st.session_state.doc_sec_id,
+                                "doc_id": st.session_state.selected_dept_id,
+                                "section_name": current,
+                                "questions": columns,
+                                "answers": [json.dumps(filled_rows)]})
+                        st.session_state.section_answers[current] = [json.dumps(filled_rows)]
+                        st.rerun()
+            else:
+                st.warning("No columns defined for this table section.")
+
+        # ── TEXT SECTION: normal Q&A ──────────────────────────────────────────
         else:
-            st.markdown("*Leave blank = auto-fill with professional content*")
-            for i, q in enumerate(questions):
-                a = st.text_area(f"**Q{i+1}:** {q}", key=f"a_{current}_{i}",
-                                  height=72, placeholder="Your answer (or leave blank)...")
-                user_answers.append(a)
+            user_answers = []
+            if not questions:
+                st.info("No questions for this section — content will be auto-generated.")
+            else:
+                st.markdown("*Leave blank = auto-fill with professional content*")
+                for i, q in enumerate(questions):
+                    a = st.text_area(f"**Q{i+1}:** {q}", key=f"a_{current}_{i}",
+                                     height=72, placeholder="Your answer (or leave blank)...")
+                    user_answers.append(a)
 
-        st.markdown("---")
-        c1, c2 = st.columns([1, 3])
+            st.markdown("---")
+            c1, c2 = st.columns([1, 3])
 
-        with c1:
-            if st.button("⏭️ Skip", use_container_width=True):
-                if sec_id:
-                    api_post("/answers/save", {
-                        "sec_id": sec_id, "doc_sec_id": st.session_state.doc_sec_id,
-                        "doc_id": st.session_state.selected_dept_id,
-                        "section_name": current, "questions": questions,
-                        "answers": ["__skipped__"] * len(questions)})
-                st.session_state.skipped_sections.add(current); st.rerun()
+            with c1:
+                if st.button("⏭️ Skip", use_container_width=True):
+                    if sec_id:
+                        api_post("/answers/save", {
+                            "sec_id": sec_id, "doc_sec_id": st.session_state.doc_sec_id,
+                            "doc_id": st.session_state.selected_dept_id,
+                            "section_name": current, "questions": questions,
+                            "answers": ["__skipped__"] * len(questions)})
+                    st.session_state.skipped_sections.add(current); st.rerun()
 
-        with c2:
-            if st.button("Save & Next →", type="primary", use_container_width=True):
-                filled = [a.strip() if a.strip() else "not answered" for a in user_answers]
-                if sec_id:
-                    api_post("/answers/save", {
-                        "sec_id": sec_id, "doc_sec_id": st.session_state.doc_sec_id,
-                        "doc_id": st.session_state.selected_dept_id,
-                        "section_name": current, "questions": questions, "answers": filled})
-                st.session_state.section_answers[current] = filled; st.rerun()
+            with c2:
+                if st.button("Save & Next →", type="primary", use_container_width=True):
+                    filled = [a.strip() if a.strip() else "not answered" for a in user_answers]
+                    if sec_id:
+                        api_post("/answers/save", {
+                            "sec_id": sec_id, "doc_sec_id": st.session_state.doc_sec_id,
+                            "doc_id": st.session_state.selected_dept_id,
+                            "section_name": current, "questions": questions, "answers": filled})
+                    st.session_state.section_answers[current] = filled; st.rerun()
 
         if ans_map or skipped:
             st.markdown("---")
