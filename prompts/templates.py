@@ -472,373 +472,346 @@ DOC_STRUCTURE_METADATA = {
     },
 }
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-#  HELPER UTILITIES
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_doc_metadata(doc_type: str) -> dict:
-    """Fetch structural metadata for a doc type. Returns safe defaults if not found."""
-    return DOC_STRUCTURE_METADATA.get(doc_type, {
-        "has_table": False,
-        "has_flowchart": False,
-        "has_raci": False,
-        "has_signature_block": True,
-        "tone": "professional_formal",
-        "doc_purpose": "Professional business document",
-    })
-
-
-def build_structure_instructions(meta: dict) -> str:
-    """Build dynamic rendering instructions based on doc metadata."""
-    instructions = []
-
-    if meta.get("has_table"):
-        hint = meta.get("table_hint", "")
-        instructions.append(
-            f"- TABLE REQUIRED: Include a professional markdown table. Suggested content: {hint}. "
-            f"Use bold headers, align columns clearly, and populate with realistic placeholder data."
-        )
-
-    if meta.get("has_flowchart"):
-        hint = meta.get("flowchart_hint", "")
-        instructions.append(
-            f"- FLOWCHART REQUIRED: Insert a Mermaid.js flowchart diagram using ```mermaid code block. "
-            f"Suggested flow: {hint}. Use TD (top-down) direction. Label each step clearly. "
-            f"Use decision diamonds ({{...}}) where the process branches."
-        )
-
-    if meta.get("has_raci"):
-        hint = meta.get("raci_hint", "")
-        instructions.append(
-            f"- RACI MATRIX REQUIRED: Include a RACI responsibility table. Suggested roles: {hint}. "
-            f"Columns: Activity | Responsible | Accountable | Consulted | Informed. "
-            f"Cover at least 6-8 key activities for this document type."
-        )
-
-    if meta.get("has_signature_block"):
-        instructions.append(
-            "- SIGNATURE BLOCK REQUIRED: End the document with a formal Approvals & Sign-off section "
-            "containing a markdown table with columns: Role | Name | Signature | Date. "
-            "Include at least 3 relevant approver roles for this document type."
-        )
-
-    if not instructions:
-        instructions.append(
-            "- This document type does not require tables, flowcharts, or RACI matrices. "
-            "Focus on clear, structured prose with well-organised sections."
-        )
-
-    return "\n".join(instructions)
-
-
-def build_answers_block(answers: dict, sections: list) -> str:
-    """Format user answers by section for injection into the generation prompt."""
-    lines = []
-    for sec in sections:
-        lines.append(f"\n[SECTION: {sec['name']}]")
-        for (key, label, _) in sec.get("questions", []):
-            val = answers.get(key, "Not provided")
-            lines.append(f"  Q: {label}")
-            lines.append(f"  A: {val}")
-    return "\n".join(lines)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  PHASE 1 — QUESTION GENERATION PROMPT
-#  Called when sections are fetched from DB and sent to LLM to generate
-#  contextual questions section by section. Questions saved back to DB.
+#  QUESTION GENERATION PROMPTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-PHASE_1_QUESTION_GEN_PROMPT = """You are DocForge AI — an expert enterprise documentation specialist.
+from langchain_core.prompts import PromptTemplate
 
-Your task: Generate smart, targeted questions for ONE SECTION of a professional business document.
-These questions will be shown to the user in the UI. Their answers will be used to generate a
-complete industry-standard document.
+# ── Text ──────────────────────────────────────────────────────────────────────
 
-DOCUMENT TYPE: {doc_type}
-DEPARTMENT: {department}
-INDUSTRY: {industry}
-COMPANY SIZE: {company_size}
+TEXT_QUESTIONS_PROMPT = PromptTemplate(
+    input_variables=["section_name", "doc_type", "department",
+                     "company_name", "industry", "company_size", "region"],
+    template="""You are an expert enterprise documentation specialist.
 
-CURRENT SECTION: {section_name}
-SECTION PURPOSE: {section_purpose}
+Decide how many questions (0, 1, 2, or 3) are needed to fill this section, then write exactly that many.
 
-REQUIREMENTS:
-1. Generate exactly {question_count} questions for this section.
-2. Questions must be specific to {doc_type} — not generic.
-3. Ask for concrete details: names, dates, numbers, percentages, policies, procedures.
-4. Use plain, professional English. No jargon.
-5. Each question should unlock a different piece of information needed for this section.
-6. Order questions from most important to least important.
-7. Do NOT ask for information already covered in previous sections: {completed_sections}
+Document Type : {doc_type}
+Department    : {department}
+Section       : {section_name}
+Company       : {company_name} | Industry: {industry} | Size: {company_size} | Region: {region}
 
-OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no preamble:
-{{
-  "section": "{section_name}",
-  "questions": [
-    {{
-      "key": "unique_snake_case_key",
-      "label": "Clear question text shown to user",
-      "input_type": "text|textarea|date|number|select",
-      "placeholder": "Example answer to guide the user",
-      "required": true
-    }}
-  ]
-}}"""
+Decision rules:
+- 0 questions: Purely structural section — intro boilerplate, version history, disclaimer.
+  Respond with exactly: NONE
+- 1 question: One concrete detail unlocks the whole section (e.g. effective date, policy owner)
+- 2 questions: Two distinct pieces of context needed
+- 3 questions: Complex section needing multiple specifics (maximum — do not exceed 3)
+
+Quality rules:
+- Ask for SPECIFIC data: names, dates, numbers, percentages, policy details
+- Do NOT ask generic questions like "describe the company" or "what is the purpose"
+- Each question must unlock a DIFFERENT piece of information
+- Questions must be directly relevant to writing the {section_name} of a {doc_type}
+
+Output: one question per line, no numbering, no bullet points, no extra text.
+If 0 questions: respond NONE
+
+Respond now:"""
+)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  PHASE 2 — FULL DOCUMENT GENERATION PROMPT
-#  Called after ALL section answers are collected from the user.
-#  All Q&A data + user inputs are combined and sent to LLM in one call.
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Table ─────────────────────────────────────────────────────────────────────
 
-PHASE_2_DOCUMENT_GEN_PROMPT = """You are DocForge AI — an enterprise documentation specialist with 20+ years of experience
-creating industry-standard business documents across all departments and industries.
+TABLE_QUESTIONS_PROMPT = PromptTemplate(
+    input_variables=["section_name", "doc_type", "department",
+                     "company_name", "industry", "table_hint"],
+    template="""You are an expert enterprise documentation specialist.
 
-════════════════════════════════════════════════════════════
-DOCUMENT BRIEF
-════════════════════════════════════════════════════════════
-Document Type   : {doc_type}
-Department      : {department}
-Industry        : {industry}
-Company Name    : {company_name}
-Company Size    : {company_size}
-Document Purpose: {doc_purpose}
-Tone            : {tone}
+This section will be rendered as a DATA TABLE. Write 1–3 questions to collect the exact
+row data that should appear in the table.
 
-════════════════════════════════════════════════════════════
-USER-PROVIDED INFORMATION (Answers by Section)
-════════════════════════════════════════════════════════════
-{answers_block}
+Document Type : {doc_type}
+Department    : {department}
+Section       : {section_name}
+Company       : {company_name} | Industry: {industry}
+Table hint    : {table_hint}
 
-════════════════════════════════════════════════════════════
-DOCUMENT SECTIONS TO GENERATE (from database)
-════════════════════════════════════════════════════════════
-{section_list}
+Rules:
+- Ask for the ACTUAL DATA ROWS, not descriptions or explanations
+- Be specific about the format you expect
+  Good: "List each expense item with: date, category, description, and amount (one item per line)"
+  Bad:  "What expenses were incurred?"
+- If the table has a natural primary key (employee name, vendor name, product), ask for it explicitly
+- Maximum 3 questions
+- One question per line, no numbering, no bullet points
 
-════════════════════════════════════════════════════════════
-STRUCTURAL REQUIREMENTS FOR THIS DOCUMENT TYPE
-════════════════════════════════════════════════════════════
-{structure_instructions}
+Respond now:"""
+)
 
-════════════════════════════════════════════════════════════
-GENERATION RULES — FOLLOW EXACTLY
-════════════════════════════════════════════════════════════
-FORMATTING:
-1. Start with a professional document header:
-   - Company name and logo placeholder: [COMPANY LOGO]
-   - Document title (bold, centered)
-   - Document reference number: DOC-{department_code}-[AUTO]
-   - Version, Date, Prepared By, Approved By
-   - Horizontal rule (---)
 
-2. Use ## for each section heading (exactly matching the section names from the database).
-3. Write 200–350 words per section — expand user answers into professional prose.
-   Do NOT copy user answers verbatim. Transform them into polished business language.
-4. Maintain consistent terminology throughout (e.g., always use the same job title,
-   company name, product name as provided).
+# ── Flowchart ─────────────────────────────────────────────────────────────────
 
-CONTENT QUALITY:
-5. Write as a subject matter expert, not as a template filler.
-6. Include specific details from user answers — dates, names, numbers, percentages.
-7. For any field marked "Not provided", use a realistic professional placeholder in [brackets].
-8. Legal and compliance language should be precise and unambiguous.
-9. Each section must flow logically into the next.
+FLOWCHART_QUESTIONS_PROMPT = PromptTemplate(
+    input_variables=["section_name", "doc_type", "department",
+                     "company_name", "industry", "flowchart_hint"],
+    template="""You are an expert enterprise documentation specialist.
 
-TABLES & DIAGRAMS (only include what STRUCTURE REQUIREMENTS specifies):
-10. Tables: Use markdown table format with bold column headers. Include realistic data rows.
-11. Flowcharts: Use Mermaid.js ```mermaid code block. Direction: TD. Min 5 nodes.
-12. RACI: Full matrix covering all key activities for this document type.
-13. All tables must be complete — no empty cells, use "N/A" or "TBD" where appropriate.
+This section will be rendered as a PROCESS FLOWCHART (Mermaid diagram).
+Write 1–3 questions to collect the process steps and decision points.
 
-SIGN-OFF:
-14. Always end with an ## Approvals & Sign-off section with a signature table if required.
-15. The final line should be: *This document is confidential and intended solely for the
-    named recipients. Unauthorised distribution is prohibited.*
+Document Type  : {doc_type}
+Department     : {department}
+Section        : {section_name}
+Company        : {company_name} | Industry: {industry}
+Flowchart hint : {flowchart_hint}
 
-Generate the complete, professional {doc_type} now:"""
+Rules:
+- Ask about the SEQUENCE OF STEPS in the process
+- Ask about DECISION POINTS (yes/no branches, approvals, conditions)
+- Ask about the ROLES or SYSTEMS involved at each step
+- Maximum 3 questions
+- One question per line, no numbering, no bullet points
+
+Good example questions for a process flow:
+  "List the sequential steps in this process from start to finish (e.g. Step 1: Submit request, Step 2: Manager review...)"
+  "At which steps does the process branch based on a yes/no decision? What are the two outcomes?"
+  "Which team or role is responsible for each step?"
+
+Respond now:"""
+)
+
+
+# ── RACI ──────────────────────────────────────────────────────────────────────
+
+RACI_QUESTIONS_PROMPT = PromptTemplate(
+    input_variables=["section_name", "doc_type", "department",
+                     "company_name", "industry", "raci_hint"],
+    template="""You are an expert enterprise documentation specialist.
+
+This section will be rendered as a RACI RESPONSIBILITY MATRIX TABLE.
+Write 1–2 questions to collect role and activity information.
+
+Document Type : {doc_type}
+Department    : {department}
+Section       : {section_name}
+Company       : {company_name} | Industry: {industry}
+RACI hint     : {raci_hint}
+
+Rules:
+- Question 1: Ask for the list of ROLES or JOB TITLES involved in this process
+- Question 2 (optional): Ask for the key ACTIVITIES or TASKS to include in the matrix
+- Maximum 2 questions
+- One question per line, no numbering, no bullet points
+
+Respond now:"""
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  PHASE 3A — SECTION ENHANCEMENT PROMPT
-#  Called when user clicks "Enhance" on a single section in the editor.
-#  Only that section's content is sent to the LLM.
+#  SECTION CONTENT GENERATION PROMPTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-PHASE_3A_SECTION_ENHANCE_PROMPT = """You are DocForge AI — an enterprise documentation specialist.
+# ── Text ──────────────────────────────────────────────────────────────────────
 
-Your task: ENHANCE a single section of an existing business document.
+SECTION_TEXT_PROMPT = PromptTemplate(
+    input_variables=["doc_type", "department", "section_name", "company_name",
+                     "industry", "company_size", "region", "qa_block", "target_words"],
+    template="""You are a professional enterprise documentation writer.
 
-DOCUMENT TYPE: {doc_type}
-DEPARTMENT: {department}
-SECTION NAME: {section_name}
+Write the "{section_name}" section of a {doc_type}.
 
-CURRENT SECTION CONTENT:
-\"\"\"
-{current_section_content}
-\"\"\"
+Company: {company_name} | Dept: {department} | Industry: {industry} | Region: {region}
 
-ENHANCEMENT INSTRUCTIONS:
-1. Preserve all factual information (names, dates, numbers, percentages).
-2. Improve professional tone and readability.
-3. Expand thin content to 200–350 words with industry-appropriate language.
-4. Add structure if missing: sub-headings, bullet points, or numbered lists where appropriate.
-5. Strengthen opening and closing sentences.
-6. Remove redundant phrases and tighten language.
-7. If this section should contain a table based on its context, add one.
-8. Do NOT change the meaning or intent of any statement.
-9. Do NOT add new facts that were not in the original.
+User-provided information:
+{qa_block}
 
-OUTPUT: Return ONLY the enhanced section content (starting from the section heading ##).
-Do not include any preamble, explanation, or surrounding context."""
+STRICT RULES:
+1. Write EXACTLY {target_words} words — hard limit, do NOT exceed
+2. PLAIN TEXT ONLY — zero markdown, no asterisks (*), no # symbols, no backticks
+3. Paragraphs separated by one blank line
+4. Lists: use "1. Item" or "- Item" syntax only
+5. If an answer is "not answered" — write realistic, industry-appropriate placeholder content
+6. Do NOT include the section heading in your output
+7. Professional {department} department tone throughout
+8. Do NOT begin with "This section..." or "In this section..."
+
+Write now:"""
+)
+
+
+# ── Table ─────────────────────────────────────────────────────────────────────
+
+SECTION_TABLE_PROMPT = PromptTemplate(
+    input_variables=["doc_type", "department", "section_name", "company_name",
+                     "industry", "region", "qa_block", "table_hint"],
+    template="""You are a professional enterprise documentation writer.
+
+Write the "{section_name}" section of a {doc_type}. This section MUST contain a data table.
+
+Company: {company_name} | Dept: {department} | Industry: {industry} | Region: {region}
+Table guidance: {table_hint}
+
+User-provided data:
+{qa_block}
+
+OUTPUT FORMAT — follow EXACTLY:
+1. One professional sentence introducing the table (plain text, no markdown)
+2. A blank line
+3. A properly formatted pipe table using the user's data:
+
+Column1 | Column2 | Column3
+------- | ------- | -------
+value1  | value2  | value3
+value2  | value2  | value3
+
+STRICT RULES:
+- Column names must be industry-standard for {section_name} in a {doc_type}
+- Use the user's data to populate rows; if data is missing, use realistic placeholders in [brackets]
+- Minimum 3 data rows, maximum 10 rows
+- NO markdown outside the table — no **, no ##, no backticks
+- The intro sentence goes BEFORE the table, never inside a cell
+- Do NOT include the section heading in output
+
+Write now:"""
+)
+
+
+# ── Flowchart ─────────────────────────────────────────────────────────────────
+
+SECTION_FLOWCHART_PROMPT = PromptTemplate(
+    input_variables=["doc_type", "department", "section_name", "company_name",
+                     "industry", "region", "qa_block", "flowchart_hint"],
+    template="""You are a professional enterprise documentation writer and process designer.
+
+Write the "{section_name}" section of a {doc_type}. This section MUST contain a Mermaid flowchart.
+
+Company: {company_name} | Dept: {department} | Industry: {industry} | Region: {region}
+Process hint: {flowchart_hint}
+
+User-provided process information:
+{qa_block}
+
+OUTPUT FORMAT — follow EXACTLY:
+1. One professional sentence describing the process (plain text, no markdown)
+2. A blank line
+3. A Mermaid flowchart using this EXACT format:
+
+```mermaid
+flowchart TD
+    A[Start: Step Name] --> B[Step Name]
+    B --> C{{Decision Point?}}
+    C -->|Yes| D[Step if Yes]
+    C -->|No| E[Step if No]
+    D --> F[Next Step]
+    E --> F
+    F --> G([End])
+```
+
+STRICT RULES:
+- Use TD direction (top-down)
+- Minimum 6 nodes, maximum 12 nodes
+- Use [Rectangle] for regular steps
+- Use {{Diamond}} for decision/approval steps (Yes/No branches)
+- Use ([Rounded]) for Start and End nodes
+- Label all arrow branches on decision nodes with |Yes| or |No| or relevant label
+- Node text must be SHORT — max 5 words per node
+- Use ACTUAL steps from the user's answers; if no data, use standard steps for {section_name} of a {doc_type}
+- Close the mermaid block with ``` on its own line
+- NO other markdown outside the mermaid block — no **, no ##
+- Do NOT include the section heading in output
+
+Write now:"""
+)
+
+
+# ── RACI ──────────────────────────────────────────────────────────────────────
+
+SECTION_RACI_PROMPT = PromptTemplate(
+    input_variables=["doc_type", "department", "section_name", "company_name",
+                     "industry", "region", "qa_block", "raci_hint"],
+    template="""You are a professional enterprise documentation writer.
+
+Write the "{section_name}" section of a {doc_type}. This section MUST contain a RACI matrix.
+
+Company: {company_name} | Dept: {department} | Industry: {industry} | Region: {region}
+RACI guidance: {raci_hint}
+
+User-provided role information:
+{qa_block}
+
+OUTPUT FORMAT — follow EXACTLY:
+1. One professional sentence about accountability for this process (plain text, no markdown)
+2. A blank line
+3. A RACI table in this EXACT pipe format:
+
+Activity | [Role 1] | [Role 2] | [Role 3] | [Role 4]
+-------- | -------- | -------- | -------- | --------
+Activity Name | R | A | C | I
+Activity Name | C | R | A | I
+Activity Name | I | C | R | A
+
+RACI KEY (add this after the table):
+R = Responsible | A = Accountable | C = Consulted | I = Informed
+
+STRICT RULES:
+- Replace [Role N] with actual role names from user's answers, or use standard roles for {doc_type}
+- Minimum 6 activities, maximum 10 activities
+- Every row must have exactly one R and exactly one A
+- Activities must be specific to {section_name} of a {doc_type} — not generic
+- Do NOT use markdown outside the table — no **, no ##, no backticks
+- Do NOT include the section heading in output
+
+Write now:"""
+)
+
+
+# ── Signature ─────────────────────────────────────────────────────────────────
+
+SECTION_SIGNATURE_PROMPT = PromptTemplate(
+    input_variables=["doc_type", "department", "company_name", "section_name"],
+    template="""You are a professional enterprise documentation writer.
+
+Write the "{section_name}" section of a {doc_type} for {company_name} ({department} department).
+
+This section is a formal approval and sign-off block.
+
+OUTPUT FORMAT — follow EXACTLY:
+1. One sentence stating this document requires the following authorised signatures (plain text)
+2. A blank line
+3. A pipe-format signature table:
+
+Role | Name | Signature | Date
+---- | ---- | --------- | ----
+[Relevant Role 1] | __________________ | __________________ | __________
+[Relevant Role 2] | __________________ | __________________ | __________
+[Relevant Role 3] | __________________ | __________________ | __________
+
+STRICT RULES:
+- Use 3–5 role rows appropriate for a {doc_type} in the {department} department
+- Role names must be specific and relevant (e.g., "HR Manager", "Chief People Officer", "Employee")
+- Name, Signature, Date fields must be blank lines (__________) for manual completion
+- NO other markdown — no **, no ##, no backticks
+- Do NOT include the section heading in output
+
+Write now:"""
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  PHASE 3B — SECTION EDIT PROMPT
-#  Called when user makes a specific edit instruction via text input.
+#  EDIT PROMPT
 # ─────────────────────────────────────────────────────────────────────────────
 
-PHASE_3B_SECTION_EDIT_PROMPT = """You are DocForge AI — an enterprise documentation specialist.
+EDIT_PROMPT = PromptTemplate(
+    input_variables=["section_name", "section_type", "current_content", "edit_instruction"],
+    template="""Professional enterprise document editor.
 
-Your task: EDIT a single section of a business document based on specific user instructions.
+Section      : {section_name}
+Section Type : {section_type}
 
-DOCUMENT TYPE: {doc_type}
-DEPARTMENT: {department}
-SECTION NAME: {section_name}
+Current Content:
+{current_content}
 
-CURRENT SECTION CONTENT:
-\"\"\"
-{current_section_content}
-\"\"\"
+Edit Instruction: {edit_instruction}
 
-USER'S EDIT INSTRUCTION:
-\"{edit_instruction}\"
+OUTPUT RULES based on section type:
+- text      → PLAIN TEXT ONLY, no markdown, no asterisks, no # symbols
+- table     → Keep pipe-format table intact; plain text intro sentence only
+- flowchart → Keep the ```mermaid ... ``` block intact; update steps if instructed
+- raci      → Keep pipe-format RACI table intact; update roles/activities if instructed
+- signature → Keep pipe-format signature table intact
 
-EDITING RULES:
-1. Apply the edit instruction precisely and completely.
-2. Preserve all content that the instruction does NOT ask to change.
-3. Maintain the professional tone and document style.
-4. Keep section length appropriate (150–350 words unless instruction specifies otherwise).
-5. If the instruction is ambiguous, apply the most reasonable professional interpretation.
-
-OUTPUT: Return ONLY the edited section content (starting from the section heading ##).
-Do not include any preamble, explanation, or note about what was changed."""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  PHASE 4 — FULL DOCUMENT RE-GENERATION (for credits/re-run)
-#  Same as Phase 2 but triggered by user requesting a full regeneration
-#  after edits. Passes current edited sections as context.
-# ─────────────────────────────────────────────────────────────────────────────
-
-PHASE_4_REGEN_PROMPT = """You are DocForge AI — an enterprise documentation specialist.
-
-The user has requested a full document regeneration based on their edited sections.
-Regenerate the complete document using the edited content as the authoritative source of information.
-
-DOCUMENT TYPE: {doc_type}
-DEPARTMENT: {department}
-INDUSTRY: {industry}
-COMPANY NAME: {company_name}
-
-CURRENT EDITED SECTIONS (use these as the source of truth):
-{edited_sections_block}
-
-SECTIONS TO REGENERATE:
-{section_list}
-
-STRUCTURAL REQUIREMENTS:
-{structure_instructions}
-
-Apply all the same formatting, table, flowchart, and sign-off rules as the original generation.
-Improve consistency, tone, and flow across sections. Do NOT invent new facts.
-
-Generate the complete regenerated {doc_type} now:"""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  PROMPT BUILDER — Main entry point called by your backend
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_question_prompt(doc_type: str, department: str, industry: str,
-                          company_size: str, section_name: str,
-                          section_purpose: str, completed_sections: list,
-                          question_count: int = 5) -> str:
-    return PHASE_1_QUESTION_GEN_PROMPT.format(
-        doc_type=doc_type,
-        department=department,
-        industry=industry,
-        company_size=company_size,
-        section_name=section_name,
-        section_purpose=section_purpose,
-        completed_sections=", ".join(completed_sections) if completed_sections else "None",
-        question_count=question_count,
-    )
-
-
-def build_document_prompt(doc_type: str, department: str, industry: str,
-                          company_name: str, company_size: str,
-                          answers: dict, sections: list) -> str:
-    meta = get_doc_metadata(doc_type)
-    answers_block = build_answers_block(answers, sections)
-    section_list = "\n".join([f"  {i+1}. {s['name']}" for i, s in enumerate(sections)])
-    structure_instructions = build_structure_instructions(meta)
-    department_code = department.upper().replace(" ", "_")[:6]
-
-    return PHASE_2_DOCUMENT_GEN_PROMPT.format(
-        doc_type=doc_type,
-        department=department,
-        industry=industry,
-        company_name=company_name,
-        company_size=company_size,
-        doc_purpose=meta.get("doc_purpose", "Professional business document"),
-        tone=meta.get("tone", "professional_formal"),
-        answers_block=answers_block,
-        section_list=section_list,
-        structure_instructions=structure_instructions,
-        department_code=department_code,
-    )
-
-
-def build_enhance_prompt(doc_type: str, department: str,
-                         section_name: str, current_content: str) -> str:
-    return PHASE_3A_SECTION_ENHANCE_PROMPT.format(
-        doc_type=doc_type,
-        department=department,
-        section_name=section_name,
-        current_section_content=current_content,
-    )
-
-
-def build_edit_prompt(doc_type: str, department: str, section_name: str,
-                      current_content: str, edit_instruction: str) -> str:
-    return PHASE_3B_SECTION_EDIT_PROMPT.format(
-        doc_type=doc_type,
-        department=department,
-        section_name=section_name,
-        current_section_content=current_content,
-        edit_instruction=edit_instruction,
-    )
-
-
-def build_regen_prompt(doc_type: str, department: str, industry: str,
-                       company_name: str, edited_sections: dict,
-                       sections: list) -> str:
-    meta = get_doc_metadata(doc_type)
-    edited_block = "\n\n".join(
-        [f"[{name}]\n{content}" for name, content in edited_sections.items()]
-    )
-    section_list = "\n".join([f"  {i+1}. {s['name']}" for i, s in enumerate(sections)])
-    structure_instructions = build_structure_instructions(meta)
-
-    return PHASE_4_REGEN_PROMPT.format(
-        doc_type=doc_type,
-        department=department,
-        industry=industry,
-        company_name=company_name,
-        edited_sections_block=edited_block,
-        section_list=section_list,
-        structure_instructions=structure_instructions,
-    )
+Apply the edit instruction to the content above and return ONLY the updated content.
+Do not add explanations, preambles, or notes about what changed."""
+)

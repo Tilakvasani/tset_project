@@ -547,6 +547,9 @@ async def fetch_library_from_notion() -> list:
             sel = props.get(k, {}).get("select")
             return sel.get("name", "") if sel else ""
 
+        def get_number(k):
+            return props.get(k, {}).get("number") or 0
+
         library.append({
             "title":      get_text("Title"),
             "doc_type":   get_text("Doc Type"),
@@ -555,5 +558,7 @@ async def fetch_library_from_notion() -> list:
             "status":     get_select("Status"),
             "notion_url": page.get("url", ""),
             "created_at": page.get("created_time", "")[:10],
+            "version":    get_number("Version"),
+            "word_count": get_number("Word Count"),
         })
     return library

@@ -710,16 +710,30 @@ if st.session_state.active_tab == "library":
 
         for doc in filtered:
             sc = {"Generated":"#ff6b00","Draft":"#f59e0b","Reviewed":"#60a5fa","Archived":"#3a3a5a"}.get(doc.get("status",""),"#3a3a5a")
+            version    = doc.get("version", 1) or 1
+            word_count = doc.get("word_count", 0) or 0
+            ver_color  = "#ea580c" if version == 1 else "#7c3aed" if version == 2 else "#0891b2"
             a,b,c = st.columns([4,2,1])
             with a:
-                st.markdown(f'<div class="lib-card"><div class="lib-title">{doc.get("title","—")}</div>'
-                            f'<div class="lib-meta">{doc.get("doc_type","—")} · {doc.get("industry","—")}</div></div>',
-                            unsafe_allow_html=True)
+                st.markdown(
+                    f'<div class="lib-card">'
+                    f'<div class="lib-title">{doc.get("title","—")}'
+                    f'<span style="margin-left:8px;background:{ver_color}22;color:{ver_color};'
+                    f'border:1px solid {ver_color}44;border-radius:999px;padding:1px 9px;'
+                    f'font-size:0.68rem;font-weight:700">v{version}</span></div>'
+                    f'<div class="lib-meta">{doc.get("doc_type","—")} · {doc.get("industry","—")}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True)
             with b:
-                st.markdown(f'<div class="lib-card"><div class="lib-meta">🏢 {doc.get("department","—")}</div>'
-                            f'<div class="lib-meta">📅 {doc.get("created_at","—")}</div>'
-                            f'<div class="lib-meta" style="color:{sc}">● {doc.get("status","—")}</div></div>',
-                            unsafe_allow_html=True)
+                wc_display = f"{word_count:,} words" if word_count else "—"
+                st.markdown(
+                    f'<div class="lib-card">'
+                    f'<div class="lib-meta">🏢 {doc.get("department","—")}</div>'
+                    f'<div class="lib-meta">📅 {doc.get("created_at","—")}</div>'
+                    f'<div class="lib-meta" style="color:{sc}">● {doc.get("status","—")}</div>'
+                    f'<div class="lib-meta">📝 {wc_display}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True)
             with c:
                 if doc.get("notion_url"):
                     st.link_button("Open →", doc["notion_url"], use_container_width=True)
@@ -1302,8 +1316,9 @@ elif st.session_state.active_tab == "generate":
                         "company_context": ctx,
                     })
                 if res:
-                    url = res.get("notion_url","")
-                    st.success("✅ Published to Notion!")
+                    url     = res.get("notion_url","")
+                    version = res.get("version", 1)
+                    st.success(f"✅ Published to Notion as v{version}!")
                     if url: st.link_button("🔗 Open in Notion", url, use_container_width=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
