@@ -3,7 +3,6 @@ DocForge AI — streamlit_app.py  v7.0
 Premium dark UI with amber/orange glow aesthetic.
 Bug fixes:
   - Answer textarea values stored in session state via on_change → never disappear
-  - skipped_sections always cast to set()
   - docx cache invalidated on edit
   - library loads/caches correctly
   - section_questions missing key handled gracefully
@@ -186,13 +185,6 @@ st.markdown("""
     border: 1px solid #e5e7eb;
     border-radius: 8px; padding: 7px 10px; margin-bottom: 5px;
     font-size: 0.78rem; color: #9ca3af;
-    display: flex; align-items: center; gap: 6px;
-}
-.sec-skip {
-    background: #fffbeb;
-    border: 1px solid #fde68a;
-    border-radius: 8px; padding: 7px 10px; margin-bottom: 5px;
-    font-size: 0.78rem; color: #f59e0b;
     display: flex; align-items: center; gap: 6px;
 }
 .sec-answered {
@@ -536,13 +528,6 @@ def api_post(ep, data, timeout=120):
         st.error(f"Connection error: {e}")
     return None
 
-def get_skipped() -> set:
-    v = st.session_state.get("skipped_sections", set())
-    if not isinstance(v, set):
-        v = set(v)
-        st.session_state.skipped_sections = v
-    return v
-
 TYPE_ICON  = {"table":"📊","flowchart":"🔀","raci":"👥","signature":"✍️","text":"✏️"}
 TYPE_CLS   = {"table":"tb-table","flowchart":"tb-flowchart","raci":"tb-raci","signature":"tb-signature"}
 
@@ -564,7 +549,7 @@ def init_session():
         selected_dept=None, selected_dept_id=None,
         selected_doc_type=None, doc_sec_id=None, sections=[],
         section_questions={}, section_answers={},
-        skipped_sections=set(), section_contents={},
+        section_contents={},
         sec_ids_ordered=[], gen_id=None, full_document="",
         active_tab="generate",
         docx_bytes_cache=None, docx_cache_doc=None,
@@ -630,10 +615,9 @@ with st.sidebar:
                 f'</div>', unsafe_allow_html=True)
 
         if st.session_state.sections:
-            done_n  = len(st.session_state.section_contents)
-            skip_n  = len(get_skipped())
-            total_n = len(st.session_state.sections)
-            active_n = max(total_n - skip_n, 1)
+            done_n   = len(st.session_state.section_contents)
+            total_n  = len(st.session_state.sections)
+            active_n = total_n
             pct = int(done_n / active_n * 100)
             sb_progress_slot = st.empty()
             sb_progress_slot.markdown(
@@ -798,7 +782,6 @@ elif st.session_state.active_tab == "generate":
                     st.session_state.sections           = deduped
                     st.session_state.section_questions  = {}
                     st.session_state.section_answers    = {}
-                    st.session_state.skipped_sections   = set()
                     st.session_state.section_contents   = {}
                     st.session_state.full_document      = ""
                     st.session_state.gen_id             = None
@@ -909,29 +892,20 @@ elif st.session_state.active_tab == "generate":
     elif st.session_state.step == 3:
         sections   = st.session_state.sections
         ans_map    = st.session_state.section_answers
-        skip_set   = get_skipped()
         q_map      = st.session_state.section_questions
-        unanswered = [s for s in sections if s not in ans_map and s not in skip_set]
+        unanswered = [s for s in sections if s not in ans_map]
 
         # ── All done → generate ───────────────────────────────────────────────
         if not unanswered:
             st.markdown('<div class="step-pill">✅ Step 3 of 5 — Ready to Generate</div>',
                         unsafe_allow_html=True)
-            c1,c2,c3 = st.columns(3)
+            c1, c2 = st.columns(2)
             with c1: st.markdown(stat_box(len(ans_map),"Answered"), unsafe_allow_html=True)
-            with c2: st.markdown(stat_box(len(skip_set),"Skipped"), unsafe_allow_html=True)
-            with c3: st.markdown(stat_box(len(sections)-len(skip_set),"Will Generate"), unsafe_allow_html=True)
-
-            if skip_set:
-                st.markdown(
-                    f'<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:10px;'
-                    f'padding:10px 16px;color:#d97706;font-size:0.82rem;font-weight:500">'
-                    f'⚠️ Skipped: {", ".join(skip_set)} — will use auto-generated content.</div>',
-                    unsafe_allow_html=True)
+            with c2: st.markdown(stat_box(len(sections),"Will Generate"), unsafe_allow_html=True)
 
             st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
             if st.button("⚡ Generate Document", type="primary", use_container_width=True):
-                active = [s for s in sections if s not in skip_set]
+                active = sections
                 total  = len(active)
                 gen_status = st.empty()
                 ids = []
@@ -1012,7 +986,7 @@ elif st.session_state.active_tab == "generate":
         # ── Still answering ───────────────────────────────────────────────────
         else:
             current   = unanswered[0]
-            done_cnt  = len(ans_map) + len(skip_set)
+            done_cnt  = len(ans_map)
             total     = len(sections)
             q_data    = q_map.get(current, {})
             questions = q_data.get("questions", [])
@@ -1087,23 +1061,8 @@ elif st.session_state.active_tab == "generate":
                         st.session_state._answer_drafts[current][i] = a
                     user_answers.append(a)
 
-            b1,b2 = st.columns([1,3])
+            b1, = [st.columns(1)[0]]
             with b1:
-                if st.button("⏭ Skip", use_container_width=True):
-                    if sec_id:
-                        api_post("/answers/save",{
-                            "sec_id":sec_id,
-                            "doc_sec_id":st.session_state.doc_sec_id,
-                            "doc_id":st.session_state.selected_dept_id,
-                            "section_name":current,
-                            "questions":questions,
-                            "answers":["not answered"]*max(len(questions),1),
-                        })
-                    st.session_state.skipped_sections.add(current)
-                    # Clear draft for this section
-                    st.session_state._answer_drafts.pop(current, None)
-                    st.rerun()
-            with b2:
                 if st.button("Save & Next →", type="primary", use_container_width=True):
                     filled = [a.strip() if a.strip() else "not answered" for a in user_answers]
                     if sec_id:
@@ -1122,35 +1081,21 @@ elif st.session_state.active_tab == "generate":
                     st.rerun()
 
             # ── Answered/Skipped summary ──────────────────────────────────
-            if ans_map or skip_set:
+            if ans_map:
                 st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
-                ca, cb = st.columns(2)
-                with ca:
-                    if ans_map:
-                        st.markdown('<div style="font-size:0.68rem;color:#ff6b00;font-weight:700;'
-                                    'letter-spacing:0.08em;margin-bottom:6px">ANSWERED</div>',
-                                    unsafe_allow_html=True)
-                        for s in sections:
-                            if s in ans_map:
-                                # Show stored answers
-                                saved = ans_map[s]
-                                saved_qs = q_map.get(s,{}).get("questions",[])
-                                st.markdown(f'<div class="sec-answered">✓ <strong>{s}</strong></div>',
-                                            unsafe_allow_html=True)
-                with cb:
-                    if skip_set:
-                        st.markdown('<div style="font-size:0.68rem;color:#f59e0b;font-weight:700;'
-                                    'letter-spacing:0.08em;margin-bottom:6px">SKIPPED</div>',
-                                    unsafe_allow_html=True)
-                        for s in skip_set:
-                            st.markdown(f'<div class="sec-skip">⏭ {s}</div>',
+                if ans_map:
+                    st.markdown('<div style="font-size:0.68rem;color:#ff6b00;font-weight:700;'
+                                'letter-spacing:0.08em;margin-bottom:6px">ANSWERED</div>',
+                                unsafe_allow_html=True)
+                    for s in sections:
+                        if s in ans_map:
+                            st.markdown(f'<div class="sec-answered">✓ <strong>{s}</strong></div>',
                                         unsafe_allow_html=True)
 
 
     # ── STEP 4 ────────────────────────────────────────────────────────────────
     elif st.session_state.step == 4:
-        skip_set = get_skipped()
-        active   = [s for s in st.session_state.sections if s not in skip_set]
+        active   = st.session_state.sections
         contents = st.session_state.section_contents
 
         st.markdown('<div class="step-pill">🔍 Step 4 of 5 — Review & Edit</div>',
@@ -1158,133 +1103,11 @@ elif st.session_state.active_tab == "generate":
 
         def rebuild_doc():
             lines = []
-            cur_active = [s for s in st.session_state.sections if s not in get_skipped()]
-            for sec in cur_active:
-                c = st.session_state.section_contents.get(sec, "").strip()
+            for sec in active:
+                c = contents.get(sec, "").strip()
                 if c:
                     lines += [sec.upper(), "-" * len(sec), "", c, "", ""]
             st.session_state.full_document = "\n".join(lines).strip()
-
-        # ── Top action bar: Enhance All + Add Section + Remove Section ────────
-        ta1, ta2, ta3 = st.columns(3)
-
-        with ta1:
-            if st.button("✨ Enhance Full Document", type="primary", use_container_width=True):
-                cur_active = [s for s in st.session_state.sections if s not in get_skipped()]
-                total = len(cur_active)
-                enhance_status = st.empty()
-                enhance_status.info(f"Enhancing {total} sections one by one...")
-                with st.spinner("Enhancing full document..."):
-                    res = api_post("/document/enhance", {
-                        "doc_type":        st.session_state.selected_doc_type,
-                        "department":      st.session_state.selected_dept,
-                        "company_context": st.session_state.company_ctx,
-                        "sections":        {s: contents.get(s, "") for s in cur_active},
-                        "section_order":   cur_active,
-                    }, timeout=300)
-                if res:
-                    for sec, content in res.get("sections", {}).items():
-                        if content:
-                            st.session_state.section_contents[sec] = content
-                    st.session_state.full_document    = res.get("full_document", "")
-                    st.session_state.docx_bytes_cache = None
-                    enhance_status.empty()
-                    st.success(f"✨ All {total} sections enhanced!")
-                    st.rerun()
-
-        with ta2:
-            if st.button("➕ Add Section", use_container_width=True):
-                st.session_state["_show_add_section"] = not st.session_state.get("_show_add_section", False)
-                st.session_state["_show_remove_section"] = False
-                st.rerun()
-
-        with ta3:
-            if st.button("🗑️ Remove Section", use_container_width=True):
-                st.session_state["_show_remove_section"] = not st.session_state.get("_show_remove_section", False)
-                st.session_state["_show_add_section"] = False
-                st.rerun()
-
-        # ── Add Section panel ─────────────────────────────────────────────────
-        if st.session_state.get("_show_add_section"):
-            st.markdown(
-                '<div class="df-card" style="border-color:#fed7aa;background:#fff7ed">' +
-                '<div class="df-card-title">➕ Add New Section</div>',
-                unsafe_allow_html=True)
-            new_sec_name = st.text_input(
-                "Section Name",
-                placeholder="e.g. Risk Assessment, Escalation Policy, Revision History...",
-                key="new_sec_input")
-            ac1, ac2 = st.columns(2)
-            with ac1:
-                if st.button("⚡ Generate Section", type="primary", use_container_width=True):
-                    if not new_sec_name.strip():
-                        st.warning("Enter a section name.")
-                    elif new_sec_name.strip() in st.session_state.sections:
-                        st.warning("Section already exists.")
-                    else:
-                        cur_active = [s for s in st.session_state.sections if s not in get_skipped()]
-                        with st.spinner(f"Generating '{new_sec_name}'..."):
-                            res = api_post("/section/add", {
-                                "section_name":      new_sec_name.strip(),
-                                "doc_type":          st.session_state.selected_doc_type,
-                                "department":        st.session_state.selected_dept,
-                                "company_context":   st.session_state.company_ctx,
-                                "existing_sections": {s: contents.get(s, "") for s in cur_active},
-                            }, timeout=120)
-                        if res:
-                            if not res.get("relevant", True):
-                                st.error(f"⚠️ {res.get('message', 'Section is not relevant to this document.')}")
-                            else:
-                                new_name = res["section_name"]
-                                st.session_state.sections.append(new_name)
-                                st.session_state.section_contents[new_name] = res["content"]
-                                st.session_state.section_questions[new_name] = {"section_type": "text"}
-                                st.session_state.docx_bytes_cache = None
-                                rebuild_doc()
-                                st.session_state["_show_add_section"] = False
-                                st.success(f"✅ '{new_name}' added!")
-                                st.rerun()
-            with ac2:
-                if st.button("Cancel", use_container_width=True, key="cancel_add"):
-                    st.session_state["_show_add_section"] = False
-                    st.rerun()
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        # ── Remove Section panel ──────────────────────────────────────────────
-        if st.session_state.get("_show_remove_section"):
-            cur_active = [s for s in st.session_state.sections if s not in get_skipped()]
-            st.markdown(
-                '<div class="df-card" style="border-color:#fecaca;background:#fef2f2">' +
-                '<div class="df-card-title" style="color:#dc2626">🗑️ Remove Section</div>',
-                unsafe_allow_html=True)
-            sec_to_remove = st.selectbox(
-                "Select section to remove",
-                cur_active,
-                key="remove_sec_select",
-                label_visibility="collapsed")
-            rc1, rc2 = st.columns(2)
-            with rc1:
-                if st.button("🗑️ Confirm Remove", type="primary", use_container_width=True):
-                    if sec_to_remove in st.session_state.sections:
-                        st.session_state.sections.remove(sec_to_remove)
-                        st.session_state.section_contents.pop(sec_to_remove, None)
-                        st.session_state.section_questions.pop(sec_to_remove, None)
-                        st.session_state.section_answers.pop(sec_to_remove, None)
-                        st.session_state.docx_bytes_cache = None
-                        rebuild_doc()
-                        st.session_state["_show_remove_section"] = False
-                        st.success(f"🗑️ '{sec_to_remove}' removed.")
-                        st.rerun()
-            with rc2:
-                if st.button("Cancel", use_container_width=True, key="cancel_remove"):
-                    st.session_state["_show_remove_section"] = False
-                    st.rerun()
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-
-        # ── Section editor ────────────────────────────────────────────────────
-        active = [s for s in st.session_state.sections if s not in get_skipped()]
 
         left, right = st.columns([1, 2])
 
@@ -1309,7 +1132,8 @@ elif st.session_state.active_tab == "generate":
                 if "```mermaid" in (cur or ""):
                     st.markdown(cur)
                 elif not cur:
-                    st.markdown('<div style="color:#9ca3af;font-style:italic;padding:1rem">(empty)</div>', unsafe_allow_html=True)
+                    st.markdown('<div style="color:#9ca3af;font-style:italic;padding:1rem">(empty)</div>',
+                                unsafe_allow_html=True)
                 else:
                     _lines = cur.split("\n")
                     _html = '<div style="font-family:Georgia,serif;font-size:0.88rem;color:#1f2937;line-height:1.8;padding:1.2rem 1.5rem;background:#fafafa;border-radius:10px;border:1px solid #e5e7eb;">'
@@ -1363,11 +1187,10 @@ elif st.session_state.active_tab == "generate":
 
     # ── STEP 5 ────────────────────────────────────────────────────────────────
     elif st.session_state.step == 5:
-        skip_set = get_skipped()
         ctx      = st.session_state.company_ctx
         doc_type = st.session_state.selected_doc_type
         full_doc = st.session_state.full_document
-        active   = [s for s in st.session_state.sections if s not in skip_set]
+        active   = st.session_state.sections
         contents = st.session_state.section_contents
 
         st.markdown('<div class="step-pill">💾 Step 5 of 5 — Export</div>', unsafe_allow_html=True)
@@ -1401,7 +1224,7 @@ elif st.session_state.active_tab == "generate":
                 <div><div style="font-size:0.68rem;color:#ea580c;font-weight:700;margin-bottom:3px;text-transform:uppercase;letter-spacing:0.05em">Industry</div>
                      <div style="font-size:0.9rem;color:#374151">{ctx.get("industry","—")}</div></div>
                 <div><div style="font-size:0.68rem;color:#ea580c;font-weight:700;margin-bottom:3px;text-transform:uppercase;letter-spacing:0.05em">Sections</div>
-                     <div style="font-size:0.9rem;color:#374151">{len(active)} active · {len(skip_set)} skipped</div></div>
+                     <div style="font-size:0.9rem;color:#374151">{len(active)} sections</div></div>
                 <div><div style="font-size:0.68rem;color:#ea580c;font-weight:700;margin-bottom:3px;text-transform:uppercase;letter-spacing:0.05em">Words</div>
                      <div style="font-size:0.9rem;color:#374151">~{len(full_doc.split())} words</div></div>
             </div>
