@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     AZURE_OPENAI_LLM_KEY:         str = ""
     AZURE_LLM_ENDPOINT:           str = ""
     AZURE_LLM_DEPLOYMENT_41_MINI: str = "gpt-4.1-mini"
+    AZURE_LLM_API_VERSION:        str = "2024-12-01-preview"   # ADDED
 
     AZURE_OPENAI_EMB_KEY:  str = ""
     AZURE_EMB_ENDPOINT:    str = ""
@@ -25,6 +26,7 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = str(ENV_FILE)
+        extra    = "ignore"              # ADDED: unknown .env keys won't crash
 
 settings = Settings()
 

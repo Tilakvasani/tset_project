@@ -104,6 +104,19 @@ def _lookup_ground_truth(question: str) -> Optional[str]:
     return None
 
 
+# ── RAGAS version detection ───────────────────────────────────────────────────
+
+def _get_ragas_version() -> tuple[int, int]:
+    """Return (major, minor) of installed ragas package."""
+    try:
+        import importlib.metadata
+        v = importlib.metadata.version("ragas")
+        parts = v.split(".")
+        return int(parts[0]), int(parts[1])
+    except Exception:
+        return (0, 1)  # assume old if unknown
+
+
 # ── RAGAS init ────────────────────────────────────────────────────────────────
 
 def _init_ragas() -> bool:
@@ -114,16 +127,11 @@ def _init_ragas() -> bool:
         return True
 
     try:
-        from ragas.metrics import (
-            faithfulness,
-            answer_relevancy,
-            context_precision,
-            context_recall,
-        )
-        from ragas.llms import LangchainLLMWrapper
-        from ragas.embeddings import LangchainEmbeddingsWrapper
         from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
         from backend.core.config import settings
+
+        major, minor = _get_ragas_version()
+        logger.info("Detected RAGAS version %d.%d", major, minor)
 
         judge_llm = AzureChatOpenAI(
             azure_endpoint=settings.AZURE_LLM_ENDPOINT,
@@ -139,44 +147,110 @@ def _init_ragas() -> bool:
             api_version=settings.AZURE_EMB_API_VERSION,
         )
 
-        _ragas_llm = LangchainLLMWrapper(judge_llm)
-        _ragas_emb = LangchainEmbeddingsWrapper(judge_emb)
+        if major == 0 and minor >= 2:
+            # ── RAGAS v0.2+ API ──────────────────────────────────────────────
+            from ragas.metrics import (
+                Faithfulness,
+                AnswerRelevancy,
+                ContextPrecision,
+                ContextRecall,
+            )
+            from ragas.llms import LangchainLLMWrapper
+            from ragas.embeddings import LangchainEmbeddingsWrapper
 
-        _faithfulness      = faithfulness
-        _answer_relevancy  = answer_relevancy
-        _context_precision = context_precision
-        _context_recall    = context_recall
+            _ragas_llm = LangchainLLMWrapper(judge_llm)
+            _ragas_emb = LangchainEmbeddingsWrapper(judge_emb)
 
-        _faithfulness.llm            = _ragas_llm
-        _answer_relevancy.llm        = _ragas_llm
-        _answer_relevancy.embeddings = _ragas_emb
-        _context_precision.llm       = _ragas_llm
-        _context_recall.llm          = _ragas_llm
+            _faithfulness      = Faithfulness(llm=_ragas_llm)
+            _answer_relevancy  = AnswerRelevancy(llm=_ragas_llm, embeddings=_ragas_emb)
+            _context_precision = ContextPrecision(llm=_ragas_llm)
+            _context_recall    = ContextRecall(llm=_ragas_llm)
+
+        else:
+            # ── RAGAS v0.1 API ───────────────────────────────────────────────
+            from ragas.metrics import (
+                faithfulness,
+                answer_relevancy,
+                context_precision,
+                context_recall,
+            )
+            from ragas.llms import LangchainLLMWrapper
+            from ragas.embeddings import LangchainEmbeddingsWrapper
+
+            _ragas_llm = LangchainLLMWrapper(judge_llm)
+            _ragas_emb = LangchainEmbeddingsWrapper(judge_emb)
+
+            _faithfulness      = faithfulness
+            _answer_relevancy  = answer_relevancy
+            _context_precision = context_precision
+            _context_recall    = context_recall
+
+            _faithfulness.llm            = _ragas_llm
+            _answer_relevancy.llm        = _ragas_llm
+            _answer_relevancy.embeddings = _ragas_emb
+            _context_precision.llm       = _ragas_llm
+            _context_recall.llm          = _ragas_llm
 
         _ragas_ready = True
-        logger.info("RAGAS scorer initialized")
+        logger.info("RAGAS scorer initialized (v%d.%d)", major, minor)
         return True
 
-    except ImportError:
-        logger.warning("RAGAS not installed. Run: pip install ragas datasets")
+    except ImportError as e:
+        logger.error("RAGAS import failed — is ragas installed? Error: %s", e)
         return False
     except Exception as e:
-        logger.warning("RAGAS init failed: %s", e)
+        logger.error("RAGAS init failed: %s", e, exc_info=True)
         return False
 
 
 # ── Single metric runner ──────────────────────────────────────────────────────
 
 def _run_single_metric(metric, data) -> Optional[float]:
-    """Run one RAGAS metric synchronously inside a thread executor."""
+    """Run one RAGAS metric synchronously inside a thread executor.
+    Supports both v0.1 (evaluate()) and v0.2+ (metric.score()) APIs.
+    """
+    import os
+    os.environ["TQDM_DISABLE"] = "1"
+
+    major, minor = _get_ragas_version()
+    metric_name  = getattr(metric, "name", type(metric).__name__)
+
     try:
-        from ragas import evaluate
-        result = evaluate(data, metrics=[metric])
-        df  = result.to_pandas()
-        col = df.columns[-1]
-        return round(float(df.iloc[0][col]), 3)
+        if major == 0 and minor >= 2:
+            # v0.2+ uses EvaluationDataset + metric.score()
+            from ragas import evaluate as ragas_evaluate
+            from ragas import EvaluationDataset
+
+            # EvaluationDataset expects a list of dicts
+            rows = [
+                {k: v[0] for k, v in data.to_dict().items()}
+            ]
+            eval_dataset = EvaluationDataset.from_list(rows)
+
+            import contextlib, io
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                result = ragas_evaluate(eval_dataset, metrics=[metric])
+
+            df  = result.to_pandas()
+            col = metric_name if metric_name in df.columns else df.columns[-1]
+            val = df.iloc[0][col]
+            return round(float(val), 3)
+
+        else:
+            # v0.1 uses HuggingFace Dataset + evaluate()
+            from ragas import evaluate
+            import contextlib, io
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                result = evaluate(data, metrics=[metric])
+
+            df  = result.to_pandas()
+            col = df.columns[-1]
+            return round(float(df.iloc[0][col]), 3)
+
     except Exception as e:
-        logger.warning("Metric %s failed: %s", getattr(metric, "name", str(metric)), e)
+        logger.error("Metric %s failed: %s", metric_name, e, exc_info=True)
         return None
 
 
@@ -222,11 +296,12 @@ async def score(
     # Resolve ground truth: caller override > dataset lookup > None
     real_gt = ground_truth or _lookup_ground_truth(question)
 
-    # Build datasets
+    # Build datasets — HuggingFace Dataset format works for both v0.1 and v0.2+
+    # (v0.2 _run_single_metric converts to EvaluationDataset internally)
     from datasets import Dataset
 
     data_no_gt = Dataset.from_dict({
-        "question": [question],
+        "question": [question], 
         "answer":   [answer],
         "contexts": [contexts],
     })
@@ -237,6 +312,9 @@ async def score(
         "contexts":     [contexts],
         "ground_truth": [real_gt],
     }) if real_gt else None
+
+    major, minor = _get_ragas_version()
+    logger.info("Running RAGAS scoring with v%d.%d", major, minor)
 
     loop = asyncio.get_event_loop()
 
@@ -251,7 +329,7 @@ async def score(
     results = await asyncio.gather(
         _run(_faithfulness,      data_no_gt),
         _run(_answer_relevancy,  data_no_gt),
-        _run(_context_precision, data_no_gt),
+        _run(_context_precision, data_with_gt),
         _run(_context_recall,    data_with_gt),
         return_exceptions=True,
     )

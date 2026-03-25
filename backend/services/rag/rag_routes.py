@@ -93,3 +93,75 @@ async def api_flush_cache():
     count += await cache.flush_pattern("docforge:rag:session:*")
     count += await cache.flush_pattern("docforge:rag:answer:*")
     return {"flushed": count}
+
+
+@router.get("/scores")
+async def api_get_scores(key: str):
+    """
+    Poll for RAGAS scores by ragas_key returned from /ask.
+    Returns scores dict if ready, null if still computing, error string if failed.
+    """
+    if not key or not key.startswith("ragas:"):
+        raise HTTPException(status_code=400, detail="Invalid ragas_key format")
+    try:
+        scores = await cache.get(key)
+        return {"key": key, "scores": scores, "ready": scores is not None}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class EvalRequest(BaseModel):
+    question:     str
+    ground_truth: str = ""   # optional — enables context_recall scoring
+    top_k:        int = 15
+
+
+@router.post("/eval")
+async def api_eval(req: EvalRequest):
+    """
+    Manual RAGAS evaluation endpoint.
+    Runs RAG then awaits real RAGAS scoring synchronously — scores are
+    guaranteed in the response (no background task, no polling needed).
+    Use this from the RAGAS tab manual eval panel, NOT from the chat UI.
+    """
+    try:
+        from backend.services.rag.rag_service import answer
+        from backend.services.rag.ragas_scorer import score as ragas_score
+
+        # Step 1: get RAG answer + retrieved chunks
+        rag_result = await answer(
+            question=req.question,
+            filters={},
+            session_id="ragas_eval",
+            top_k=req.top_k,
+        )
+
+        chunks      = rag_result.get("chunks", [])
+        rag_answer  = rag_result.get("answer", "")
+
+        # Step 2: run real RAGAS synchronously (await — blocks until done)
+        ragas_scores = None
+        ragas_error  = None
+        if chunks and rag_answer:
+            try:
+                ragas_scores = await ragas_score(
+                    question=req.question,
+                    answer=rag_answer,
+                    chunks=chunks,
+                    ground_truth=req.ground_truth.strip() or None,
+                )
+                logger.info("Eval RAGAS scores: %s", ragas_scores)
+            except Exception as e:
+                ragas_error = str(e)
+                logger.error("RAGAS scoring failed in /eval: %s", e, exc_info=True)
+                ragas_scores = None
+
+        return {
+            **rag_result,
+            "ragas_scores": ragas_scores,
+            "ragas_error":  ragas_error,
+        }
+
+    except Exception as e:
+        logger.error("Eval error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))

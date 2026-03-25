@@ -321,7 +321,8 @@ def init_session():
         docx_bytes_cache=None, docx_cache_doc=None,
         _library_data=None, _answer_drafts={},
         _last_chunks=[],
-        _last_ragas_scores=None,   # ← NEW: stores RAGAS scores from last /rag/ask
+        _last_ragas_scores=None,   # stores RAGAS scores from last /rag/ask
+        _ragas_history=[],         # [{question, scores, timestamp, tool_used}]
     )
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -342,7 +343,7 @@ with st.sidebar:
 
     tab = st.radio(
         "Mode",
-        ["💬 CiteRAG", "⚡ DocForge", "📚 Library"],
+        ["💬 CiteRAG", "⚡ DocForge", "📚 Library", "📊 RAGAS"],
         label_visibility="collapsed",
         key="main_tab",
         horizontal=False,
@@ -351,6 +352,8 @@ with st.sidebar:
         st.session_state.active_tab = "generate"
     elif "Library" in tab:
         st.session_state.active_tab = "library"
+    elif "RAGAS" in tab:
+        st.session_state.active_tab = "ragas"
     else:
         st.session_state.active_tab = "ask"
 
@@ -663,7 +666,18 @@ if st.session_state.active_tab == "ask":
                     "doc_b":       res.get("doc_b", "Document B"),
                 })
             st.session_state._last_chunks       = res.get("chunks", [])
-            st.session_state._last_ragas_scores = res.get("ragas_scores")  # ← RAGAS scores
+            st.session_state._last_ragas_scores = res.get("ragas_scores")
+            # Append to RAGAS history for the dedicated tab
+            _rscores = res.get("ragas_scores")
+            if _rscores:
+                import time as _time
+                st.session_state._ragas_history.append({
+                    "question":  question,
+                    "scores":    _rscores,
+                    "tool_used": res.get("tool_used", ""),
+                    "timestamp": _time.strftime("%H:%M:%S"),
+                })
+                st.session_state._ragas_history = st.session_state._ragas_history[-20:]
         else:
             ai_msg = {
                 "role":      "assistant",
@@ -735,107 +749,6 @@ if st.session_state.active_tab == "ask":
                 cards_html += "</div>"
                 st.markdown(cards_html, unsafe_allow_html=True)
 
-            # ── RAGAS quality section ─────────────────────────────────────────
-            ragas = st.session_state.get("_last_ragas_scores")
-
-            # ── Proxy scores from chunks (used when RAGAS not yet wired) ─────
-            if ragas is None and chunks:
-                all_scores   = [c.get("score", 0) for c in chunks if c.get("score")]
-                top_scores   = sorted(all_scores, reverse=True)
-                above_thresh = sum(1 for s in all_scores if s >= 0.5)
-                ctx_precision = round(above_thresh / len(all_scores), 2) if all_scores else 0.0
-                unique_docs  = len({c.get("doc_title", "") for c in chunks if c.get("doc_title")})
-                ctx_recall   = round(min(unique_docs / 3, 1.0), 2)
-                top3_avg     = round(sum(top_scores[:3]) / min(len(top_scores), 3), 2) if top_scores else 0.0
-                faithfulness = round(min(top3_avg + 0.05, 1.0), 2)
-                ans_relevancy = round(top_scores[0], 2) if top_scores else 0.0
-                ragas = {
-                    "faithfulness":      faithfulness,
-                    "answer_relevancy":  ans_relevancy,
-                    "context_precision": ctx_precision,
-                    "context_recall":    ctx_recall,
-                    "_is_proxy":         True,
-                }
-
-            is_proxy    = ragas.get("_is_proxy", False) if ragas else False
-            badge_label = "estimated" if is_proxy else "RAGAS"
-
-            metrics = [
-                ("Faithfulness",      ragas.get("faithfulness", 0)      if ragas else 0, "no hallucination"),
-                ("Answer relevancy",  ragas.get("answer_relevancy", 0)   if ragas else 0, "on-topic answer"),
-                ("Context precision", ragas.get("context_precision", 0)  if ragas else 0, "clean retrieval"),
-                ("Context recall",    ragas.get("context_recall", 0)     if ragas else 0, "full coverage"),
-            ]
-
-            def _bar_color(v):
-                if v >= 0.85: return "#22c55e", "#4ade80"   # green fill, green text
-                if v >= 0.70: return "#f59e0b", "#fbbf24"   # amber fill, amber text
-                return "#ef4444", "#f87171"                  # red fill, red text
-
-            rows_html  = ""
-            warn_lines = []
-
-            for label, val, hint in metrics:
-                pct           = int(val * 100)
-                bar_col, txt_col = _bar_color(val)
-                score_str     = f"{val:.2f}"
-
-                if val < 0.70:
-                    if "faith" in label.lower():
-                        warn_lines.append("&#9888; <b>Faithfulness low</b> — answer may contain claims not grounded in the documents.")
-                    elif "precision" in label.lower():
-                        warn_lines.append("&#9888; <b>Context precision low</b> — retriever fetched irrelevant chunks. Try raising the score threshold.")
-                    elif "recall" in label.lower():
-                        warn_lines.append("&#9888; <b>Context recall low</b> — relevant chunks may have been missed. Consider increasing top_k.")
-                    elif "relev" in label.lower():
-                        warn_lines.append("&#9888; <b>Answer relevancy low</b> — answer drifted off-topic. Check intent classifier.")
-
-                rows_html += (
-                    f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:9px">'
-                    f'<span style="font-size:12px;color:#94a3b8;width:138px;flex-shrink:0">{label}</span>'
-                    f'<span style="font-size:11px;color:#334155;width:108px;flex-shrink:0">{hint}</span>'
-                    f'<div style="flex:1;height:5px;background:#1e2433;border-radius:3px;overflow:hidden;min-width:60px">'
-                    f'<div style="width:{pct}%;height:100%;background:{bar_col};border-radius:3px"></div>'
-                    f'</div>'
-                    f'<span style="font-size:12px;font-weight:600;color:{txt_col};width:34px;text-align:right;flex-shrink:0">{score_str}</span>'
-                    f'</div>'
-                )
-
-            if warn_lines:
-                warn_body = "<br>".join(warn_lines)
-                feedback_html = (
-                    f'<div style="margin-top:10px;padding:7px 11px;'
-                    f'background:rgba(245,158,11,0.08);border-left:2px solid #f59e0b;'
-                    f'border-radius:0 5px 5px 0;font-size:12px;color:#94a3b8;line-height:1.6">'
-                    f'{warn_body}</div>'
-                )
-            else:
-                feedback_html = (
-                    '<div style="margin-top:10px;padding:7px 11px;'
-                    'background:rgba(34,197,94,0.06);border-left:2px solid #22c55e;'
-                    'border-radius:0 5px 5px 0;font-size:12px;color:#475569">'
-                    'All quality metrics look good for this response.</div>'
-                )
-
-            badge_style = (
-                "font-size:10px;font-weight:700;background:rgba(29,158,117,0.15);color:#4ade80;"
-                "padding:2px 7px;border-radius:4px;letter-spacing:0.05em;"
-                "border:1px solid rgba(29,158,117,0.25)"
-            )
-
-            st.markdown(
-                f'<div style="margin-top:1.25rem;padding-top:1rem;border-top:1px solid #1e2433">'
-                f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">'
-                f'<span style="font-size:11px;font-weight:600;color:#475569;letter-spacing:0.06em;text-transform:uppercase">Answer Quality</span>'
-                f'<span style="{badge_style}">{badge_label}</span>'
-                f'</div>'
-                f'{rows_html}'
-                f'{feedback_html}'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  LIBRARY
 # ══════════════════════════════════════════════════════════════════════════════
@@ -894,6 +807,292 @@ elif st.session_state.active_tab == "library":
                     if doc.get("notion_url"):
                         st.link_button("Open →", doc["notion_url"], use_container_width=True)
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  RAGAS EVALUATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif st.session_state.active_tab == "ragas":
+
+    st.markdown("""
+<div style="padding:0 0 1rem">
+    <h2 style="color:#e2e8f0;font-weight:700;margin-bottom:0.25rem">📊 RAGAS Evaluation</h2>
+    <p style="color:#475569;font-size:0.9rem">Real answer quality scores — faithfulness, relevancy, precision, recall</p>
+</div>
+""", unsafe_allow_html=True)
+    st.divider()
+
+    def _ragas_bar_color(v):
+        if v is None:
+            return "#334155", "#475569"
+        if v >= 0.85:
+            return "#22c55e", "#4ade80"
+        if v >= 0.70:
+            return "#f59e0b", "#fbbf24"
+        return "#ef4444", "#f87171"
+
+    def _render_ragas_scores(scores, title="", timestamp=""):
+        """Render a full RAGAS score panel."""
+        if not scores:
+            return
+
+        metrics = [
+            ("Faithfulness",      scores.get("faithfulness"),      "no hallucination",
+             "Answer is grounded solely in the retrieved documents."),
+            ("Answer Relevancy",  scores.get("answer_relevancy"),   "on-topic answer",
+             "Answer directly addresses the question asked."),
+            ("Context Precision", scores.get("context_precision"),  "clean retrieval",
+             "Retrieved chunks are relevant — no noise from unrelated documents."),
+            ("Context Recall",    scores.get("context_recall"),     "full coverage",
+             "All relevant information from ground-truth was retrieved."),
+        ]
+
+        avg_vals   = [m[1] for m in metrics if m[1] is not None]
+        avg_score  = round(sum(avg_vals) / len(avg_vals), 2) if avg_vals else None
+        avg_col    = "#4ade80" if (avg_score or 0) >= 0.85 else "#fbbf24" if (avg_score or 0) >= 0.70 else "#f87171"
+
+        header_html = (
+            f'<div style="display:flex;align-items:center;justify-content:space-between;'
+            f'margin-bottom:16px">'
+            f'<div style="font-size:13px;font-weight:600;color:#cbd5e1">'
+            f'{title or "Scores"}</div>'
+            f'<div style="display:flex;align-items:center;gap:10px">'
+        )
+        if timestamp:
+            header_html += f'<span style="font-size:11px;color:#475569">{timestamp}</span>'
+        if avg_score is not None:
+            header_html += (
+                f'<span style="font-size:12px;font-weight:700;color:{avg_col};'
+                f'background:rgba(255,255,255,0.04);padding:3px 10px;border-radius:5px;'
+                f'border:1px solid {avg_col}33">avg {avg_score:.2f}</span>'
+            )
+        header_html += '</div></div>'
+
+        rows_html  = ""
+        warn_lines = []
+        has_null   = False
+
+        for label, val, hint, explanation in metrics:
+            if val is None:
+                has_null = True
+                rows_html += (
+                    f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;opacity:0.45">'
+                    f'<span style="font-size:12px;color:#94a3b8;width:150px;flex-shrink:0">{label}</span>'
+                    f'<span style="font-size:11px;color:#334155;width:110px;flex-shrink:0">{hint}</span>'
+                    f'<div style="flex:1;height:5px;background:#1e2433;border-radius:3px;min-width:80px">'
+                    f'<div style="width:0%;height:100%;background:#334155;border-radius:3px"></div></div>'
+                    f'<span style="font-size:11px;color:#334155;width:38px;text-align:right;flex-shrink:0">n/a</span>'
+                    f'</div>'
+                )
+                continue
+
+            pct                = int(val * 100)
+            bar_col, txt_col   = _ragas_bar_color(val)
+            score_str          = f"{val:.2f}"
+
+            if val < 0.70:
+                if "faith" in label.lower():
+                    warn_lines.append("&#9888; <b>Faithfulness low</b> — answer may contain claims not grounded in documents.")
+                elif "precision" in label.lower():
+                    warn_lines.append("&#9888; <b>Context precision low</b> — retriever fetched irrelevant chunks.")
+                elif "recall" in label.lower():
+                    warn_lines.append("&#9888; <b>Context recall low</b> — relevant chunks may have been missed.")
+                elif "relev" in label.lower():
+                    warn_lines.append("&#9888; <b>Answer relevancy low</b> — answer drifted off-topic.")
+
+            rows_html += (
+                f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">'
+                f'<span style="font-size:12px;color:#94a3b8;width:150px;flex-shrink:0">{label}</span>'
+                f'<span style="font-size:11px;color:#334155;width:110px;flex-shrink:0">{hint}</span>'
+                f'<div style="flex:1;height:5px;background:#1e2433;border-radius:3px;overflow:hidden;min-width:80px">'
+                f'<div style="width:{pct}%;height:100%;background:{bar_col};border-radius:3px"></div></div>'
+                f'<span style="font-size:12px;font-weight:600;color:{txt_col};width:38px;text-align:right;flex-shrink:0">{score_str}</span>'
+                f'</div>'
+            )
+
+        feedback_html = ""
+        if warn_lines:
+            feedback_html = (
+                f'<div style="margin-top:10px;padding:8px 12px;background:rgba(245,158,11,0.08);'
+                f'border-left:2px solid #f59e0b;border-radius:0 5px 5px 0;font-size:12px;color:#94a3b8;line-height:1.7">'
+                + "<br>".join(warn_lines) + '</div>'
+            )
+        elif avg_vals:
+            feedback_html = (
+                '<div style="margin-top:10px;padding:8px 12px;background:rgba(34,197,94,0.06);'
+                'border-left:2px solid #22c55e;border-radius:0 5px 5px 0;font-size:12px;color:#475569">'
+                '✓ All quality metrics look good.</div>'
+            )
+
+        if has_null:
+            feedback_html += (
+                '<div style="margin-top:8px;font-size:11px;color:#334155">'
+                '* Context recall shown as n/a — no matching ground truth in qa_dataset.json for this question.</div>'
+            )
+
+        st.markdown(
+            f'<div style="background:#131722;border:1px solid #1e2843;border-radius:12px;padding:18px 20px;margin-bottom:12px">'
+            + header_html + rows_html + feedback_html +
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Section 1: Latest scores (from most recent CiteRAG answer) ─────────────
+    last_scores = st.session_state.get("_last_ragas_scores")
+
+    if last_scores:
+        st.markdown("#### 🔬 Latest Answer Quality")
+        _render_ragas_scores(last_scores, title="Most recent question")
+    else:
+        st.info(
+            "No RAGAS scores yet. Use the **🧪 Manual Evaluation** panel below "
+            "to run RAGAS on any question — paste a question and click **▶ Run Evaluation**."
+        )
+
+    # ── Section 2: Manual eval — run RAGAS on a custom question ────────────────
+    st.divider()
+    st.markdown("#### 🧪 Manual Evaluation")
+    st.caption("Run RAGAS on any question manually — useful for testing specific queries.")
+
+    with st.container(border=True):
+        eval_q = st.text_input(
+            "Question",
+            placeholder="e.g. What is the notice period in the employment contract?",
+            key="ragas_eval_q",
+            label_visibility="visible",
+        )
+        eval_gt = st.text_area(
+            "Ground Truth (optional)",
+            placeholder="Paste the expected answer here to enable Context Recall scoring...",
+            height=80,
+            key="ragas_eval_gt",
+            label_visibility="visible",
+        )
+        if st.button("▶ Run Evaluation", type="primary", key="ragas_run_btn", use_container_width=True):
+            if not eval_q.strip():
+                st.warning("Enter a question first.")
+            else:
+                with st.spinner("⏳ Running RAG + RAGAS scoring… this takes 20–60 seconds"):
+                    import time as _rtime
+                    _ts = _rtime.strftime("%H:%M:%S")
+                    # /rag/eval runs RAGAS synchronously — real scores guaranteed in response
+                    eval_res = api_post("/rag/eval", {
+                        "question":     eval_q.strip(),
+                        "ground_truth": eval_gt.strip() if eval_gt else "",
+                        "top_k":        15,
+                    }, timeout=300)
+
+                if eval_res:
+                    _scores = eval_res.get("ragas_scores")
+                    # Show the RAG answer
+                    with st.expander("📄 RAG Answer", expanded=False):
+                        st.markdown(eval_res.get("answer", "No answer returned."))
+                        _cits = eval_res.get("citations", [])
+                        if _cits:
+                            _parts = []
+                            for c in _cits:
+                                if isinstance(c, dict) and c.get("url"):
+                                    _parts.append(f'<a href="{c["url"]}" target="_blank">{c["text"]}</a>')
+                                else:
+                                    _parts.append(str(c.get("text", c) if isinstance(c, dict) else c))
+                            st.markdown(
+                                f'<div style="font-size:12px;color:#475569;margin-top:8px">📎 {" · ".join(_parts)}</div>',
+                                unsafe_allow_html=True,
+                            )
+
+                    if _scores:
+                        st.success("✅ Real RAGAS scores ready!")
+                        _render_ragas_scores(_scores, title=eval_q[:60], timestamp=_ts)
+                        # Save to history
+                        st.session_state._ragas_history.append({
+                            "question":  eval_q.strip(),
+                            "scores":    _scores,
+                            "tool_used": eval_res.get("tool_used", ""),
+                            "timestamp": _ts,
+                        })
+                        st.session_state._ragas_history = st.session_state._ragas_history[-20:]
+                        st.session_state._last_ragas_scores = _scores
+                    else:
+                        _ragas_err = eval_res.get("ragas_error")
+                        if _ragas_err:
+                            st.error(f"❌ RAGAS scoring failed: {_ragas_err}")
+                            with st.expander("🔍 Debug info"):
+                                st.code(_ragas_err)
+                                st.markdown(
+                                    "**Common fixes:**\n"
+                                    "- RAGAS v0.2+: run `pip install ragas==0.1.21` to downgrade, "
+                                    "or the updated `ragas_scorer.py` handles v0.2 automatically\n"
+                                    "- Check Azure LLM endpoint/key in `.env`\n"
+                                    "- Check backend logs for the full traceback"
+                                )
+                        else:
+                            st.warning(
+                                "⚠️ RAGAS returned no scores and no error was reported. "
+                                "This usually means the RAG answer had no retrieved chunks, "
+                                "or `_init_ragas()` returned False silently. "
+                                "Check backend logs for `RAGAS init failed` or `RAGAS import failed`."
+                            )
+                else:
+                    st.error("Could not reach the RAG service. Make sure the backend is running.")
+
+    # ── Section 3: Session history ──────────────────────────────────────────────
+    history = st.session_state.get("_ragas_history", [])
+    if history:
+        st.divider()
+        st.markdown(f"#### 📈 Session History  <span style=\'font-size:12px;color:#475569;font-weight:400\'>{len(history)} evaluations</span>", unsafe_allow_html=True)
+
+        # Aggregate trend
+        all_faith  = [h["scores"].get("faithfulness")      for h in history if h["scores"].get("faithfulness")      is not None]
+        all_relev  = [h["scores"].get("answer_relevancy")  for h in history if h["scores"].get("answer_relevancy")  is not None]
+        all_prec   = [h["scores"].get("context_precision") for h in history if h["scores"].get("context_precision") is not None]
+        all_rec    = [h["scores"].get("context_recall")    for h in history if h["scores"].get("context_recall")    is not None]
+
+        def _avg(lst):
+            return round(sum(lst) / len(lst), 2) if lst else None
+
+        fa, ra, pa, ca = _avg(all_faith), _avg(all_relev), _avg(all_prec), _avg(all_rec)
+
+        c1, c2, c3, c4 = st.columns(4)
+        def _metric_col(col, label, val):
+            if val is not None:
+                col.metric(label, f"{val:.2f}", delta=None)
+            else:
+                col.metric(label, "n/a")
+
+        _metric_col(c1, "Avg Faithfulness",      fa)
+        _metric_col(c2, "Avg Ans. Relevancy",     ra)
+        _metric_col(c3, "Avg Context Precision",  pa)
+        _metric_col(c4, "Avg Context Recall",     ca)
+
+        st.write("")
+
+        for entry in reversed(history):
+            q_label  = entry["question"][:70] + ("…" if len(entry["question"]) > 70 else "")
+            tool_tag = f" · `{entry['tool_used']}`" if entry.get("tool_used") else ""
+            ts_tag   = f" · {entry['timestamp']}" if entry.get("timestamp") else ""
+            with st.expander(f"**{q_label}**{tool_tag}{ts_tag}"):
+                _render_ragas_scores(entry["scores"], title=entry["question"])
+
+        if st.button("🗑 Clear History", key="ragas_clear_hist"):
+            st.session_state._ragas_history = []
+            st.session_state._last_ragas_scores = None
+            st.rerun()
+
+    # ── Section 4: Metric explanations ────────────────────────────────────────
+    st.divider()
+    with st.expander("ℹ️ What do these metrics mean?"):
+        st.markdown("""
+| Metric | What it measures | Good threshold |
+|---|---|---|
+| **Faithfulness** | Is every claim in the answer supported by the retrieved documents? High = no hallucination. | ≥ 0.85 |
+| **Answer Relevancy** | Does the answer actually address the question? Low = answer went off-topic. | ≥ 0.80 |
+| **Context Precision** | Are the retrieved chunks relevant? Low = retriever is pulling in noise. | ≥ 0.75 |
+| **Context Recall** | Did retrieval cover all the important facts? Only scored when a ground truth exists in `qa_dataset.json`. | ≥ 0.75 |
+
+**Scores are real RAGAS metrics** computed by `ragas_scorer.py` using Azure OpenAI as the judge LLM.  
+Context recall shows **n/a** when no matching question is found in `qa_dataset.json`.
+""")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DOCFORGE GENERATE
