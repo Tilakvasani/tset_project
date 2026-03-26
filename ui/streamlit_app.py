@@ -768,14 +768,13 @@ if st.session_state.active_tab == "ask":
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  LIBRARY
-# ══════════════════════════════════════════════════════════════════════════════
-
-elif st.session_state.active_tab == "library":
-    st.markdown("## 📚 Document Library")
-    st.divider()
-
-    if st.button("↺ Refresh"):
-        st.session_state["_library_data"] = None
+# ═══════════════════════════════════════════════════════════════════════════════
+if st.session_state.active_tab == "library":
+    ch, cb = st.columns([4,1])
+    with ch: st.markdown("### 📚 Document Library")
+    with cb:
+        if st.button("↺ Refresh", use_container_width=True):
+            st.session_state["_library_data"] = None
 
     if st.session_state.get("_library_data") is None:
         with st.spinner("Loading from Notion..."):
@@ -810,19 +809,20 @@ elif st.session_state.active_tab == "library":
         st.divider()
 
         for doc in filtered:
-            with st.container(border=True):
-                ca, cb, cc = st.columns([4, 2, 1])
-                with ca:
-                    st.markdown(f"**{doc.get('title', '--')}**")
-                    st.caption(f"{doc.get('doc_type', '--')} · {doc.get('department', '--')}")
-                with cb:
-                    st.caption(doc.get("created_at", "--"))
-                    status = doc.get("status", "--")
-                    badge  = {"Generated": "🟢", "Draft": "🟡", "Reviewed": "🔵"}.get(status, "⚪")
-                    st.caption(f"{badge} {status}")
-                with cc:
-                    if doc.get("notion_url"):
-                        st.link_button("Open →", doc["notion_url"], use_container_width=True)
+            sc = {"Generated":"#ff6b00","Draft":"#f59e0b","Reviewed":"#60a5fa","Archived":"#3a3a5a"}.get(doc.get("status",""),"#3a3a5a")
+            a,b,c = st.columns([4,2,1])
+            with a:
+                st.markdown(f'<div class="lib-card"><div class="lib-title">{doc.get("title","—")}</div>'
+                            f'<div class="lib-meta">{doc.get("doc_type","—")} · {doc.get("industry","—")}</div></div>',
+                            unsafe_allow_html=True)
+            with b:
+                st.markdown(f'<div class="lib-card"><div class="lib-meta">🏢 {doc.get("department","—")}</div>'
+                            f'<div class="lib-meta">📅 {doc.get("created_at","—")}</div>'
+                            f'<div class="lib-meta" style="color:{sc}">● {doc.get("status","—")}</div></div>',
+                            unsafe_allow_html=True)
+            with c:
+                if doc.get("notion_url"):
+                    st.link_button("Open →", doc["notion_url"], use_container_width=True)
 
 
 
