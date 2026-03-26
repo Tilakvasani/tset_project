@@ -37,21 +37,36 @@ CRITICAL RULES:
 1. Answer ONLY what the question asks — do not volunteer unrequested analysis
 2. Be direct and concise — start with the actual answer, not a preamble
 3. Use specific facts from the documents: numbers, names, dates, conditions
-4. Cite the document name/section where the information comes from
-5. Do NOT add sections about undefined terms, missing clauses, or risks unless the question explicitly asks for an audit or analysis
-6. Do NOT pad the response with extra sections that are not relevant to the question
+4. Cite the EXACT SECTION NAME where the information comes from — not just the document title
+   WRONG: (Source: Non-Disclosure Agreement)
+   RIGHT:  (Source: Non-Disclosure Agreement — Obligations of the Receiving Party)
+5. GROUND every claim in the retrieved context — never answer from general knowledge
+   If a chunk supports the answer, quote the key clause or obligation (under 30 words)
+6. IGNORE irrelevant retrieved documents — if a chunk is from a Sales Contract but the
+   question is about the NDA, do not use it. Only cite documents directly relevant to the question
+7. Do NOT add CONTRADICTIONS / GAPS / AMBIGUITIES sections unless the question explicitly
+   asks for an audit or analysis
 
 OUTPUT FORMAT — match the question type:
 
-Single fact question → 1-2 sentences with the exact value + document reference
+Yes/No question →
+FINAL ANSWER
+[YES or NO — 1 sentence]
 
-What/How/Why question → 2-4 sentences covering the key facts from the documents
+EVIDENCE
+"[Exact quote from the retrieved chunk — max 30 words]"
+(Source: Document Name — Section Name)
 
-List question → bullet points with document references per item
+EXPLANATION
+[1-2 sentences using only the retrieved content]
 
-Yes/No question → direct YES or NO, then 1-2 sentences of evidence
+Single fact question → exact value + (Source: Document — Section)
 
-Analysis/audit question → use structured sections (CONTRADICTIONS / GAPS / AMBIGUITIES) only when asked
+What/How/Why question → 2-4 sentences with specific citations per claim
+
+List question → bullet points, each with (Source: Document — Section)
+
+Analysis/audit question → use CONTRADICTIONS / GAPS / AMBIGUITIES sections only when asked
 
 Answer:"""
 
@@ -206,6 +221,7 @@ MANDATORY REWRITES (use these exact patterns):
 - "are termination rights clearly defined" → "termination rights notice period grounds conditions both parties contracts"
 
 INTENT CLASSIFICATION RULES — read carefully:
+- GENERAL → code generation, math problems, creative writing (poems/jokes/emails), general world knowledge, tech tutorials, how-to guides — anything NOT about turabit company documents
 - GREETING → hello, hi, thanks, bye, who are you
 - ANALYSIS → review/audit/gaps/contradictions/issues/risks INSIDE the turabit documents
 - COMPARE → compare two specific turabit documents against each other
@@ -216,7 +232,19 @@ INTENT CLASSIFICATION RULES — read carefully:
 - EXPLAIN → explain something from the documents
 - SEARCH → general search inside documents
 
-EXAMPLES — DOCUMENT intent:
+EXAMPLES — GENERAL intent:
+- "write fibonacci in java" → GENERAL
+- "write me a python function to reverse a string" → GENERAL
+- "explain how neural networks work" → GENERAL
+- "what is the capital of france" → GENERAL
+- "write me an email to my manager asking for leave" → GENERAL
+- "calculate compound interest formula" → GENERAL
+- "tell me a joke" → GENERAL
+- "what is docker" → GENERAL
+- "how do i use git rebase" → GENERAL
+- "write a poem about rain" → GENERAL
+
+EXAMPLES — DOCUMENT intent (anything else):
 - "what is the notice period in our NDA?" → SPECIFIC
 - "are there any conflicting clauses?" → ANALYSIS
 - "compare SOW vs employment contract" → COMPARE
@@ -224,38 +252,7 @@ EXAMPLES — DOCUMENT intent:
 
 Reply in this exact format:
 REWRITTEN: [the clear precise question]
-INTENT: [one of: GREETING, COMPARE, FULL_DOC, SUMMARY, LIST, YESNO, SPECIFIC, EXPLAIN, ANALYSIS, SEARCH]"""
-
-# ── Classifier prompt — fires BEFORE retrieval ────────────────────────────────
-CLASSIFIER_PROMPT = """You are a query classifier for CiteRAG — turabit's internal document assistant.
-
-Your ONLY job: decide if the user's question is about turabit's internal business documents,
-OR if it is a general knowledge / personal / off-topic question.
-
-turabit's documents include:
-- HR policies (leave, salary, attendance, benefits, probation, appraisal, overtime)
-- Legal contracts (NDA, MSA, SOW, employment agreements, vendor contracts, SLA)
-- Finance documents (invoices, purchase orders, budgets, payroll, GST, TDS)
-- Operations (onboarding, offboarding, procurement, compliance, SLA)
-- Any named employee, person, or entity that appears in these internal documents
-
-ROUTING RULES:
-- DOCUMENT → question is about turabit policies, contracts, HR, finance, operations, or any
-  person/entity mentioned in these internal records (e.g. "what is rahul's employee id")
-- GENERAL → coding, math, science, creative writing, news, celebrities, general how-to,
-  or any question clearly unrelated to a business document system
-
-IMPORTANT — employee/person queries:
-- "what is rahul's employee id" → DOCUMENT (looking up internal record)
-- "who is elon musk" → GENERAL (public figure, not in turabit docs)
-- "what is priya's salary" → DOCUMENT (internal HR record)
-- "tell me a joke" → GENERAL
-
-Respond with EXACTLY one word: DOCUMENT or GENERAL
-
-Question: {question}
-
-Classification:"""
+INTENT: [one of: GREETING, GENERAL, COMPARE, FULL_DOC, SUMMARY, LIST, YESNO, SPECIFIC, EXPLAIN, ANALYSIS, SEARCH]"""
 
 ANALYSIS_PROMPT = """\
 You are CiteRAG — a senior legal and business document analyst for turabit.
@@ -315,6 +312,20 @@ RULES:
 
 Analysis:"""
 
+_GENERAL_SYSTEM_PROMPT = """\
+You are a helpful AI assistant — like ChatGPT, but also integrated with a company document system.
+For this query, NO document search is needed. Answer directly from your knowledge.
+
+RULES:
+- CODE: write clean, working, commented code inside markdown code blocks with the correct language tag (e.g. ```java, ```python)
+- MATH: show step-by-step working clearly
+- EXPLANATIONS: be clear, use examples, keep it concise
+- CREATIVE WRITING: be creative and engaging (poems, jokes, stories, emails)
+- GENERAL KNOWLEDGE: be accurate and concise
+- Always use markdown formatting when it improves readability
+- Be conversational and friendly
+- Never say "I can only answer document questions" — answer everything the user asks"""
+
 
 # ── Singleton clients (created once, reused) ──────────────────────────────────
 # PERF: Previously _get_llm() / _get_embedder() / _get_collection() created a
@@ -322,6 +333,7 @@ Analysis:"""
 # (env reads, connection pool setup). Singletons eliminate that overhead.
 
 _llm_instance = None
+_general_llm_instance = None
 _embedder_instance = None
 _collection_instance = None
 
@@ -339,6 +351,21 @@ def _get_llm():
             max_tokens=3000,
         )
     return _llm_instance
+
+
+def _get_general_llm():
+    global _general_llm_instance
+    if _general_llm_instance is None:
+        from langchain_openai import AzureChatOpenAI
+        _general_llm_instance = AzureChatOpenAI(
+            azure_endpoint=settings.AZURE_LLM_ENDPOINT,
+            api_key=settings.AZURE_OPENAI_LLM_KEY,
+            azure_deployment=settings.AZURE_LLM_DEPLOYMENT_41_MINI,
+            api_version="2024-12-01-preview",
+            temperature=0.7,
+            max_tokens=3000,
+        )
+    return _general_llm_instance
 
 
 def _get_embedder():
@@ -615,6 +642,55 @@ def _classify_intent(question: str) -> str:
     if any(q.startswith(w) for w in ["who are you", "what are you", "what can you do"]):
         return "GREETING"
 
+    if any(p in q for p in ["who is the president", "what is the capital",
+                              "prime minister of", "chief minister of", " cm of ",
+                              "ceo of ", "history of ", "population of",
+                              "who invented", "who discovered", "largest country",
+                              "when was born", "tallest building"]):
+        return "GENERAL"
+
+    _doc_words = ["policy", "contract", "letter", "offer", "document",
+                  "clause", "agreement", "nda", "sow", "handbook",
+                  "employee", "leave", "salary", "hr", "turabit"]
+    if any(q.startswith(p) for p in ["write a", "write the", "write me",
+                                      "code a", "code the", "program a",
+                                      "create a function", "implement a",
+                                      "give me a function", "build a function"]):
+        if not any(w in q for w in _doc_words):
+            return "GENERAL"
+
+    if any(p in q for p in [
+        "fibonacci", "factorial", "sorting algorithm", "binary search",
+        "linked list", "data structure", "write code", "python code",
+        "java code", "javascript code", " in python", " in java",
+        " in javascript", " in c++", " in golang", " in typescript",
+        "function that ", "algorithm for", "regex for", "sql query for",
+        "write a program", "write a script", "write a class",
+        "calculate ", "solve for", "integral of", "derivative of",
+        "what is 2+", "what is 3+", "square root of",
+        "write a poem", "write a joke", "tell me a joke",
+        "write a story", "write an essay", "write a haiku",
+        "write an email to", "draft an email", "write a message to",
+        "write a cover letter for", "write a resignation",
+        "how to install", "how to setup", "how to configure",
+        "how to use git", "how to deploy", "how to fix error",
+        "what do you think about", "what is your opinion",
+        "recommend a book", "suggest a movie", "best way to learn",
+        "what is machine learning", "what is artificial intelligence",
+        "what is blockchain", "explain quantum", "what is photosynthesis",
+        "how does the internet", "what is tcp/ip", "what is http",
+        "what is rest api", "what is docker", "what is kubernetes",
+        "write a template", "write an nda template", "write a contract template",
+        "draft a template", "create a template", "make a template",
+        "write a sample contract", "write a sample agreement",
+        "translate to ", "translate the ", "translate this ",
+        "convert to hindi", "convert to spanish", "convert to french",
+        " in hindi", " in spanish", " in french", " in german",
+        " in gujarati", " in marathi",
+    ]):
+        if not any(w in q for w in _doc_words):
+            return "GENERAL"
+
     if any(p in q for p in [
         "contradict", "contradiction", "inconsisten", "conflict",
         "internal conflict", "mutually exclusive", "violat", "comply",
@@ -629,7 +705,7 @@ def _classify_intent(question: str) -> str:
         "check", "verify", "examine",
         "improve", "recommendation", "suggest", "better",
         "complete", "correct", "accurate", "valid",
-        "comply", "complian", "enforceable",
+        "comply", "complian", "legal", "enforceable",
         "expose one party", "excessive liability", "one-sided",
         "unfair clause", "disproportionate", "favor one party",
         "unintentionally favor",
@@ -708,20 +784,11 @@ def _classify_intent(question: str) -> str:
 # ── Casual responses ──────────────────────────────────────────────────────────
 
 CASUAL_RESPONSES = {
-    "greeting": "Hi! I'm CiteRAG — turabit's document assistant. Ask me anything about your company documents: policies, contracts, HR, finance, legal, and more.",
-    "thanks":   "You're welcome! Feel free to ask anything about the documents.",
+    "greeting": "Hello! I'm CiteRAG Lab, your document assistant for turabit. Ask me anything about your company documents — policies, contracts, offers, and more.",
+    "thanks":   "You're welcome! Let me know if you have any other questions.",
     "bye":      "Goodbye! Come back anytime you need help with your documents.",
-    "identity": "I'm CiteRAG — an AI assistant that answers questions strictly based on turabit's internal documents, with citations. I don't answer general knowledge, coding, or math questions.",
+    "identity": "I'm CiteRAG Lab — an AI assistant that answers questions based on turabit's Notion documents with citations.",
 }
-
-# Response shown when user asks something outside document scope
-_OFF_TOPIC_RESPONSE = (
-    "I'm CiteRAG — I only answer questions about turabit's internal documents "
-    "(HR policies, contracts, legal, finance, operations, etc.). "
-    "I can't help with general knowledge, coding, math, or creative writing. "
-    "Try asking something like: *'What is the notice period in the employment contract?'* "
-    "or *'Are there any gaps in the NDA?'*"
-)
 
 
 def _casual_response(question: str) -> str:
@@ -782,28 +849,10 @@ async def tool_search(question: str, filters: dict,
         _get_history(session_id),
     )
 
-    # ── Early not-found guard ─────────────────────────────────────────────────
-    # If no chunks pass the quality threshold, skip the LLM entirely and return
-    # a clean one-liner instead of a padded "not found" essay.
-    quality_chunks = [c for c in chunks if c.get("score", 0) >= MIN_SCORE]
-    if not quality_chunks:
-        not_found_answer = "I could not find information about this in the available documents."
-        await _save_turn(session_id, question, not_found_answer)
-        return {
-            "answer":     not_found_answer,
-            "citations":  [],
-            "chunks":     [],
-            "tool_used":  "search",
-            "confidence": "low",
-        }
-
     answer  = _get_llm().invoke(
         ANSWER_PROMPT.format(history=history, context=context, question=question)
     ).content.strip()
     not_found = "could not find" in answer.lower()
-    if not_found:
-        # LLM said not found but we had chunks — return clean message
-        answer = "I could not find information about this in the available documents."
     await _save_turn(session_id, question, answer)
     return {
         "answer":     answer,
@@ -1085,7 +1134,7 @@ async def _rewrite_query(question: str) -> tuple[str, str]:
             elif line.startswith("INTENT:"):
                 intent = line.replace("INTENT:", "").strip().upper()
 
-        valid = {"GREETING","COMPARE","FULL_DOC","SUMMARY",
+        valid = {"GREETING","GENERAL","COMPARE","FULL_DOC","SUMMARY",
                  "LIST","YESNO","SPECIFIC","EXPLAIN","ANALYSIS","SEARCH"}
         if intent not in valid:
             intent = "SEARCH"
@@ -1098,40 +1147,29 @@ async def _rewrite_query(question: str) -> tuple[str, str]:
         return question, _classify_intent(question)
 
 
+async def _call_general_llm(question: str, session_id: str) -> dict:
+    from langchain_core.messages import SystemMessage, HumanMessage
+    history = await _get_history(session_id)
+    user_content = f"{history}\n{question}".strip() if history else question
+    # PERF: run in executor so it doesn't block event loop
+    ans = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: _get_general_llm().invoke([
+            SystemMessage(content=_GENERAL_SYSTEM_PROMPT),
+            HumanMessage(content=user_content),
+        ]).content.strip()
+    )
+    await _save_turn(session_id, question, ans)
+    return {
+        "answer":     ans,
+        "citations":  [],
+        "chunks":     [],
+        "tool_used":  "general",
+        "confidence": "high",
+    }
+
+
 # ── Main dispatcher ───────────────────────────────────────────────────────────
-
-async def _classify_document_question(question: str) -> bool:
-    """
-    Use a lightweight LLM call to decide if the question is about
-    turabit's internal documents (True) or general knowledge (False).
-
-    Uses a Redis cache with TTL=3600s so repeated identical questions
-    never cost a second LLM call.
-
-    Falls back to True (allow through to RAG) if LLM call fails —
-    better to over-retrieve than to block a valid document question.
-    """
-    cache_key = f"docforge:rag:classifier:{hashlib.md5(question.strip().lower().encode()).hexdigest()}"
-    cached = await cache.get(cache_key)
-    if cached is not None:
-        logger.info("Classifier cache HIT: %s → %s", question[:50], cached)
-        return cached == "DOCUMENT"
-
-    try:
-        raw = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: _get_llm().invoke(
-                CLASSIFIER_PROMPT.format(question=question)
-            ).content.strip().upper()
-        )
-        result = "DOCUMENT" if "DOCUMENT" in raw else "GENERAL"
-        await cache.set(cache_key, result, ttl=3600)
-        logger.info("Classifier: '%s' → %s", question[:60], result)
-        return result == "DOCUMENT"
-    except Exception as e:
-        logger.warning("Classifier LLM failed (%s) — defaulting to DOCUMENT", e)
-        return True   # fail-open: allow RAG rather than block valid question
-
 
 async def answer(
     question:   str,
@@ -1143,13 +1181,58 @@ async def answer(
 ) -> dict:
     filters = filters or {}
 
-    _akey_orig = None
-    if not doc_a and not doc_b:
+    _q_lower = question.lower().strip()
+    _skip_cache = any(_q_lower.startswith(w) for w in
+                      ["hey", "hi", "hello", "thanks", "bye", "ok", "okay"])
+    if not _skip_cache and not doc_a and not doc_b:
         _akey_orig = _answer_key(question, filters)
         _cached_orig = await cache.get(_akey_orig)
         if _cached_orig is not None:
             logger.info("Answer cache HIT (pre-rewrite) for: %s", question[:50])
             return _cached_orig
+
+    # PERF: build the answer key once here so we don't recompute below
+    if not _skip_cache and not doc_a and not doc_b:
+        pass  # _akey_orig already set above
+    else:
+        _akey_orig = None
+
+    _q = question.lower().strip()
+    _doc_signals = ["policy", "contract", "agreement", "nda", "sow", "clause",
+                    "document", "employee", "leave", "salary", "hr", "turabit",
+                    "handbook", "offer letter", "notice period", "vendor"]
+    _hard_general_patterns = [
+        "fibonacci", "factorial", "merge sort", "quick sort", "bubble sort",
+        "binary search", "linked list", "stack overflow", "write code",
+        "write a program", "write a script", "write a function", "write a class",
+        "code for ", "program for ", "algorithm for ",
+        " in python", " in java", " in javascript", " in c++", " in golang",
+        " in typescript", " in ruby", " in swift", " in kotlin",
+        "python code", "java code", "javascript code",
+        "tell me a joke", "write a poem", "write a haiku", "write a story",
+        "write an essay", "draft an email to", "write an email to",
+        "square root", "prime number", "calculate ", "integrate ",
+        "what is docker", "what is kubernetes", "what is git",
+        "what is machine learning", "what is deep learning", "what is ai",
+        "what is blockchain", "explain quantum", "how does tcp",
+        "how to install", "how to setup", "how to deploy",
+        "write a template", "write an nda template", "write a contract template",
+        "write a non-disclosure agreement template", "write an agreement template",
+        "draft a template", "create a template", "make a template",
+        "write a sample contract", "write a sample agreement",
+        "translate to ", "translate the ", "translate this ",
+        "convert to hindi", "convert to spanish", "convert to french",
+        "convert to gujarati", "convert to marathi", "convert to tamil",
+        " in hindi", " in spanish", " in french", " in german",
+        " in gujarati", " in marathi", " in tamil", " in telugu",
+    ]
+    if any(p in _q for p in _hard_general_patterns):
+        if not any(s in _q for s in _doc_signals):
+            logger.info("Hard GENERAL guard triggered for: %s", question[:50])
+            result = await _call_general_llm(question, session_id)
+            if _akey_orig:
+                await cache.set(_akey_orig, result, ttl=TTL_ANSWER)
+            return result
 
     # Use rule-based for obvious cases (fast, no LLM call)
     quick_intent = _classify_intent(question)
@@ -1158,7 +1241,8 @@ async def answer(
     # Skips an entire LLM round-trip (~3-5s) for every compare query.
     if quick_intent == "GREETING":
         intent, rewritten = "GREETING", question
-
+    elif quick_intent == "GENERAL":
+        intent, rewritten = "GENERAL", question
     elif quick_intent == "COMPARE":
         intent, rewritten = "COMPARE", question   # PERF: was falling through to _rewrite_query
     elif quick_intent == "ANALYSIS":
@@ -1188,22 +1272,11 @@ async def answer(
             "confidence": "high",
         }
 
-    # ── RAG-only guard — LLM classifier ─────────────────────────────────────────
-    # Use a lightweight LLM call to decide if the question is about turabit's
-    # internal documents or is general knowledge / off-topic.
-    # Result is cached in Redis (TTL 1h) so repeated questions cost nothing.
-    # Greeting intent already returned above — only non-greeting reaches here.
-    is_document_question = await _classify_document_question(question)
-
-    if not is_document_question:
-        await _save_turn(session_id, question, _OFF_TOPIC_RESPONSE)
-        return {
-            "answer":     _OFF_TOPIC_RESPONSE,
-            "citations":  [],
-            "chunks":     [],
-            "tool_used":  "chat",
-            "confidence": "high",
-        }
+    if intent == "GENERAL":
+        result = await _call_general_llm(question, session_id)
+        if _akey_orig:
+            await cache.set(_akey_orig, result, ttl=TTL_ANSWER)
+        return result
 
     if intent == "COMPARE" or (doc_a and doc_b):
         return await tool_compare(

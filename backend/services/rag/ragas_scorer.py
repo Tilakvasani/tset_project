@@ -149,14 +149,14 @@ def _init_ragas() -> bool:
 
         if major == 0 and minor >= 2:
             # ── RAGAS v0.2+ API ──────────────────────────────────────────────
-            from ragas.metrics import (
+            from ragas.metrics import ( #type: ignore
                 Faithfulness,
                 AnswerRelevancy,
                 ContextPrecision,
                 ContextRecall,
             )
-            from ragas.llms import LangchainLLMWrapper
-            from ragas.embeddings import LangchainEmbeddingsWrapper
+            from ragas.llms import LangchainLLMWrapper#type: ignore
+            from ragas.embeddings import LangchainEmbeddingsWrapper#type: ignore
 
             _ragas_llm = LangchainLLMWrapper(judge_llm)
             _ragas_emb = LangchainEmbeddingsWrapper(judge_emb)
@@ -168,14 +168,14 @@ def _init_ragas() -> bool:
 
         else:
             # ── RAGAS v0.1 API ───────────────────────────────────────────────
-            from ragas.metrics import (
+            from ragas.metrics import (#type: ignore
                 faithfulness,
                 answer_relevancy,
                 context_precision,
                 context_recall,
             )
-            from ragas.llms import LangchainLLMWrapper
-            from ragas.embeddings import LangchainEmbeddingsWrapper
+            from ragas.llms import LangchainLLMWrapper#type: ignore
+            from ragas.embeddings import LangchainEmbeddingsWrapper#type: ignore
 
             _ragas_llm = LangchainLLMWrapper(judge_llm)
             _ragas_emb = LangchainEmbeddingsWrapper(judge_emb)
@@ -217,11 +217,11 @@ def _run_single_metric(metric, data) -> Optional[float]:
 
     major, minor = _get_ragas_version()
     metric_name  = getattr(metric, "name", type(metric).__name__)
-
+    
     try:
         if major == 0 and minor >= 2:
             # v0.2+: data is already an EvaluationDataset — pass directly
-            from ragas import evaluate as ragas_evaluate
+            from ragas import evaluate as ragas_evaluate #type: ignore
 
             import contextlib, io
             with contextlib.redirect_stdout(io.StringIO()), \
@@ -246,12 +246,11 @@ def _run_single_metric(metric, data) -> Optional[float]:
 
         else:
             # v0.1: data is a HuggingFace Dataset
-            from ragas import evaluate
+            from ragas import evaluate#type: ignore
             import contextlib, io
             with contextlib.redirect_stdout(io.StringIO()), \
                  contextlib.redirect_stderr(io.StringIO()):
                 result = evaluate(data, metrics=[metric])
-
             df  = result.to_pandas()
             col = df.columns[-1]
             return round(float(df.iloc[0][col]), 3)
@@ -310,7 +309,7 @@ async def score(
 
     if major == 0 and minor >= 2:
         # RAGAS v0.2+ — EvaluationDataset field names
-        from ragas import EvaluationDataset
+        from ragas import EvaluationDataset#type: ignore
 
         eval_no_gt = EvaluationDataset.from_list([{
             "user_input":         question,
@@ -329,7 +328,7 @@ async def score(
         data_with_gt = eval_with_gt
     else:
         # RAGAS v0.1 — HuggingFace Dataset field names
-        from datasets import Dataset
+        from datasets import Dataset#type: ignore
 
         data_no_gt = Dataset.from_dict({
             "question": [question],

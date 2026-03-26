@@ -1042,7 +1042,7 @@ elif st.session_state.active_tab == "ragas":
                 _gt_val = st.text_input(
                     f"Ground Truth {_ri + 1}",
                     value=_row["ground_truth"],
-                    placeholder="Ground truth (optional)",
+                    placeholder="Ground truth",
                     key=f"batch_gt_{_ri}",
                     label_visibility="collapsed",
                 )

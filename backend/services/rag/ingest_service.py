@@ -73,7 +73,7 @@ def _get_collection():
 # ── Notion fetcher ─────────────────────────────────────────────────────────────
 
 def _get_notion():
-    from notion_client import Client
+    from notion_client import Client#type: ignore
     return Client(auth=settings.NOTION_TOKEN)
 
 
