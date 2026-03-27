@@ -37,8 +37,6 @@ desktop.ini
 
 # ── Project specific ──────────────────────────────────────────────────────────
 chroma_db/
-*.log
-logs/
 
 # ── Secrets (NEVER commit these) ─────────────────────────────────────────────
 .env
@@ -46,3 +44,14 @@ logs/
 .env.production
 .env.staging
 secrets.json
+
+# ChromaDB
+chroma/
+chroma_db/
+chroma-data/
+chromadb/
+
+# Persistent storage
+*.chroma
+*.db
+*.sqlite3
