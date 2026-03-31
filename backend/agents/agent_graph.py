@@ -546,8 +546,8 @@ def _block_response(reason: str) -> tuple[str, bool]:
         return _OFF_TOPIC_MSG, False
     # off_topic
     return (
-        "I could not find information about this in the available documents. "
-        "My knowledge is limited to the company's internal documents.",
+        "I could not find information about this in the available documents.My knowledge is limited to the company's internal documents."
+        ,
         False,
     )
 
@@ -555,31 +555,31 @@ def _block_response(reason: str) -> tuple[str, bool]:
 # ── Tool executors ────────────────────────────────────────────────────────────
 
 async def _exec_search(question: str, session_id: str) -> dict:
-    from backend.services.rag.rag_service import tool_search
+    from backend.rag.rag_service import tool_search
     result = await tool_search(question, {}, session_id)
     return result
 
 
 async def _exec_compare(doc_a: str, doc_b: str, question: str, session_id: str) -> dict:
-    from backend.services.rag.rag_service import tool_compare
+    from backend.rag.rag_service import tool_compare
     result = await tool_compare(question, doc_a, doc_b, {}, session_id)
     return result
 
 
 async def _exec_multi_compare(doc_names: list, question: str, session_id: str) -> dict:
-    from backend.services.rag.rag_service import tool_multi_compare
+    from backend.rag.rag_service import tool_multi_compare
     result = await tool_multi_compare(question, doc_names, {}, session_id)
     return result
 
 
 async def _exec_analyze(question: str, session_id: str) -> dict:
-    from backend.services.rag.rag_service import tool_analysis
+    from backend.rag.rag_service import tool_analysis
     result = await tool_analysis(question, {}, session_id)
     return result
 
 
 async def _exec_summarize(doc_name: str, question: str, session_id: str) -> dict:
-    from backend.services.rag.rag_service import tool_refine
+    from backend.rag.rag_service import tool_refine
     # Build a clean retrieval query: "NDA: <question>" avoids double-prefix
     q = f"{doc_name}: {question}" if doc_name else question
     result = await tool_refine(q, {}, session_id)
@@ -587,13 +587,13 @@ async def _exec_summarize(doc_name: str, question: str, session_id: str) -> dict
 
 
 async def _exec_full_doc(question: str, session_id: str) -> dict:
-    from backend.services.rag.rag_service import tool_full_doc
+    from backend.rag.rag_service import tool_full_doc
     result = await tool_full_doc(question, {}, session_id)
     return result
 
 
 async def _exec_block(reason: str, question: str, session_id: str) -> dict:
-    from backend.services.rag.rag_service import _save_turn
+    from backend.rag.rag_service import _save_turn
     msg, ticket_allowed = _block_response(reason)
     await _save_turn(session_id, question, msg)
     return {
@@ -713,7 +713,7 @@ async def _exec_create_all_tickets(session_id: str) -> str:
 
 
 async def _exec_update_ticket(status: str, session_id: str, ticket_index: int = 0) -> str:
-    from backend.services.rag.agent_routes import _notion_headers, NOTION_API
+    from backend.api.agent_routes import _notion_headers, NOTION_API
 
     memory  = await _load_memory(session_id)
     tickets = memory.get("created_tickets", [])
@@ -797,8 +797,8 @@ async def _exec_cancel(session_id: str) -> str:
 # ── Core ticket creation ──────────────────────────────────────────────────────
 
 async def _make_ticket(question: str, session_id: str, memory: dict, ticket_id: str = None) -> tuple[str, str]:
-    from backend.services.rag.ticket_dedup import find_duplicate
-    from backend.services.rag.agent_routes import _create_notion_ticket, TicketCreateRequest
+    from backend.rag.ticket_dedup import find_duplicate
+    from backend.api.agent_routes import _create_notion_ticket, TicketCreateRequest
 
     dup = await find_duplicate(question)
     if dup:
@@ -857,7 +857,7 @@ async def run_agent(
       4. Save history
       5. Return enriched result dict
     """
-    from backend.services.rag.rag_service import _get_llm
+    from backend.rag.rag_service import _get_llm
 
     # ── 1. Build context-aware message list ───────────────────────────────────
     history  = await _load_history(session_id)

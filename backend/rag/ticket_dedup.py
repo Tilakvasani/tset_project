@@ -75,7 +75,7 @@ async def _fetch_open_tickets() -> list[dict]:
     Returns [] on any error (fail-open — allow ticket creation).
     """
     try:
-        from backend.services.rag.agent_routes import _notion_headers, NOTION_API, _get_ticket_db_id
+        from backend.api.agent_routes import _notion_headers, NOTION_API, _get_ticket_db_id
 
         db_id   = _get_ticket_db_id()
         headers = _notion_headers()
@@ -141,7 +141,7 @@ async def _llm_duplicate_check(new_question: str, tickets: list[dict]) -> Option
     Returns the matching ticket dict, or None if no duplicate.
     """
     try:
-        from backend.services.rag.rag_service import _get_llm
+        from backend.rag.rag_service import _get_llm
         import asyncio
 
         # Build the ticket list string for the prompt

@@ -20,7 +20,7 @@ from backend.schemas.document_schema import (
     NotionPublishRequest,
 )
 from backend.services.redis_service import cache   # Redis caching layer
-from prompts.quality_gates import check_quality    # PS1 quality gate validator
+from backend.prompts.quality_gates import check_quality    # PS1 quality gate validator
 
 router = APIRouter()
 

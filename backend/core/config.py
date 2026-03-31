@@ -23,6 +23,8 @@ Required .env keys:
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
+from pathlib import Path
+import os
 
 
 class Settings(BaseSettings):
@@ -51,7 +53,7 @@ class Settings(BaseSettings):
     NOTION_TICKET_DB_ID:           Optional[str] = None  # Ticket tracking DB
 
     # ── Vector store ──────────────────────────────────────────────────────────
-    CHROMA_PATH:                   str = "./chroma_db"
+    CHROMA_PATH:                   str = ""
 
     # ── Cache ─────────────────────────────────────────────────────────────────
     REDIS_URL:                     str = "redis://localhost:6379/0"
@@ -62,6 +64,16 @@ class Settings(BaseSettings):
     # ── App ───────────────────────────────────────────────────────────────────
     APP_ENV:                       str = "development"
     LOG_LEVEL:                     str = "INFO"
+
+    def model_post_init(self, __context):
+        """Pydantic v2 lifecycle hook — runs after model initialization."""
+        # Resolve CHROMA_PATH to absolute path
+        if not self.CHROMA_PATH:
+            self.CHROMA_PATH = str(Path(__file__).parent.parent.parent / "chroma_db")
+        else:
+            self.CHROMA_PATH = str(Path(self.CHROMA_PATH).resolve())
+        # Auto-create directory if it doesn't exist
+        Path(self.CHROMA_PATH).mkdir(parents=True, exist_ok=True)
 
 
 settings = Settings()

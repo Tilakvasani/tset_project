@@ -16,11 +16,19 @@ Idempotent: chunks are upserted by deterministic ID (md5 of page_id+heading+chun
 so re-running ingest updates changed content without duplicating.
 
 force=True skips the "already ingested" Redis lock check.
+
+FIXES applied:
+  - Heading text is now included in the section body (was silently dropped)
+  - Headings-only sections (no body blocks) are no longer lost
+  - MIN_CHUNK_LEN lowered to 40 to avoid discarding short-but-valid chunks
+  - Per-page section/chunk log upgraded from DEBUG → INFO so it's always visible
+  - NOTION_DATABASE_ID is auto-stripped of any '?v=...' view suffix on startup
+  - Notion token fallback: tries NOTION_TOKEN then NOTION_API_KEY
+  - Redis lock is force-cleared if previous ingest never released it
 """
 
 import asyncio
 import hashlib
-import json
 import re
 import time
 from typing import Optional
@@ -32,7 +40,7 @@ from backend.services.redis_service import cache
 COLLECTION_NAME   = "rag_chunks"
 CHUNK_SIZE        = 800     # target chars per chunk
 CHUNK_OVERLAP     = 150     # overlap between consecutive chunks
-MIN_CHUNK_LEN     = 80      # discard very short fragments
+MIN_CHUNK_LEN     = 40      # discard very short fragments (lowered from 80)
 BATCH_EMBED_SIZE  = 64      # embed N chunks per API call
 INGEST_LOCK_KEY   = "docforge:rag:ingest_lock"
 INGEST_META_KEY   = "docforge:rag:ingest_meta"
@@ -67,25 +75,72 @@ def _get_collection():
             name=COLLECTION_NAME,
             metadata={"hnsw:space": "cosine"},
         )
+        logger.info("ChromaDB collection '%s' ready at %s", COLLECTION_NAME, settings.CHROMA_PATH)
     return _collection_instance
 
 
-# ── Notion fetcher ─────────────────────────────────────────────────────────────
+# ── Notion helpers ─────────────────────────────────────────────────────────────
+
+def _get_notion_token() -> str:
+    """
+    Return the Notion token, trying NOTION_TOKEN first then NOTION_API_KEY fallback.
+    Raises a clear error if neither is set.
+    """
+    token = settings.NOTION_TOKEN or settings.NOTION_API_KEY
+    if not token:
+        raise ValueError(
+            "Notion token not set. Add NOTION_TOKEN=secret_xxx to your .env file."
+        )
+    return token
+
+
+def _get_db_id() -> str:
+    """
+    Return the Notion database UUID, stripping any '?v=...' view suffix that
+    users accidentally copy from the browser URL bar.
+
+    Example:
+      Input:  32212206f265800cb9d1fa5bd2f4566f?v=32212206f265814b8846000cf4d96197
+      Output: 32212206f265800cb9d1fa5bd2f4566f
+    """
+    raw = settings.NOTION_DATABASE_ID or ""
+    # Strip full URL prefix if someone pasted the whole URL
+    if "notion.so/" in raw:
+        raw = raw.split("notion.so/")[-1]
+    # Strip query params (?v=... or ?pvs=...)
+    db_id = raw.split("?")[0].strip().rstrip("/")
+    if not db_id:
+        raise ValueError(
+            "NOTION_DATABASE_ID is not set. Add it to your .env — use only the UUID, "
+            "not the full URL. Example: NOTION_DATABASE_ID=32212206f265800cb9d1fa5bd2f4566f"
+        )
+    if db_id != raw.split("?")[0].strip():
+        logger.warning(
+            "NOTION_DATABASE_ID had a view suffix that was stripped: '%s' → '%s'",
+            settings.NOTION_DATABASE_ID, db_id,
+        )
+    return db_id
+
 
 def _get_notion():
     from notion_client import Client
-    return Client(auth=settings.NOTION_TOKEN)
+    return Client(auth=_get_notion_token())
 
 
 def _fetch_all_notion_pages() -> list[dict]:
     """
     Query all pages from the configured Notion source database.
     Handles Notion pagination automatically.
+
+    NOTE: NOTION_DATABASE_ID must be just the UUID (no '?v=...' suffix).
+          _get_db_id() strips it automatically, but fix your .env anyway.
     """
     notion  = _get_notion()
-    db_id   = settings.NOTION_DATABASE_ID
+    db_id   = _get_db_id()
     results = []
     cursor  = None
+
+    logger.info("Querying Notion DB: %s", db_id)
 
     while True:
         kwargs: dict = {"database_id": db_id, "page_size": 100}
@@ -98,6 +153,16 @@ def _fetch_all_notion_pages() -> list[dict]:
         cursor = resp.get("next_cursor")
 
     logger.info("Fetched %d pages from Notion DB %s", len(results), db_id)
+
+    if not results:
+        logger.warning(
+            "Notion returned 0 pages for DB '%s'. "
+            "Check: (1) NOTION_DATABASE_ID is correct UUID only, "
+            "(2) your integration is shared with the database in Notion "
+            "(open DB → ... → Connections → add your integration).",
+            db_id,
+        )
+
     return results
 
 
@@ -139,8 +204,15 @@ def _rich_text_to_str(rich_text_items: list) -> str:
 
 def _block_to_text(block: dict) -> tuple[str, str]:
     """
-    Extract (heading, text) from a Notion block.
-    Returns ("", "") for unsupported block types.
+    Extract (heading_label, text) from a Notion block.
+
+    heading_label — non-empty only for heading block types; signals a new section.
+    text          — the actual text content; ALWAYS returned so it can be added
+                    to the section body (fixes the original bug where heading text
+                    was set as both heading and text, then the text branch was
+                    skipped because heading was truthy).
+
+    Returns ("", "") for unsupported / empty block types.
     """
     btype = block.get("type", "")
     bdata = block.get(btype, {})
@@ -150,7 +222,7 @@ def _block_to_text(block: dict) -> tuple[str, str]:
 
     if btype in ("heading_1", "heading_2", "heading_3"):
         heading = _rich_text_to_str(bdata.get("rich_text", []))
-        text    = heading
+        text    = heading  # heading text is also kept as body content
 
     elif btype == "paragraph":
         text = _rich_text_to_str(bdata.get("rich_text", []))
@@ -185,6 +257,11 @@ def _extract_page_content(page: dict, blocks: list[dict]) -> dict:
     """
     Extract metadata and full text sections from a Notion page + its blocks.
     Returns a dict with title, doc_type, department, text sections with headings.
+
+    FIX 1: heading text is now appended to current_texts so it's included in
+            the section body and not silently discarded.
+    FIX 2: the final section is always saved even if it only contains a heading
+            with no following body blocks.
     """
     props = page.get("properties", {})
 
@@ -207,6 +284,7 @@ def _extract_page_content(page: dict, blocks: list[dict]) -> dict:
         _prop_text("Name") or _prop_text("Title") or _prop_text("Document Name")
         or page.get("url", "").split("/")[-1].replace("-", " ")
     )
+
     doc_type   = _prop_text("Doc Type") or _prop_text("Type") or _prop_text("Document Type") or ""
     department = _prop_text("Department") or _prop_text("Team") or ""
     version    = _prop_text("Version") or "v1"
@@ -223,7 +301,7 @@ def _extract_page_content(page: dict, blocks: list[dict]) -> dict:
             continue
 
         if heading:
-            # Save previous section if it has content
+            # Save the previous section before starting a new one
             if current_texts:
                 sections.append({
                     "heading": current_heading,
@@ -231,15 +309,26 @@ def _extract_page_content(page: dict, blocks: list[dict]) -> dict:
                 })
                 current_texts = []
             current_heading = heading
+            # FIX 1: include the heading text in the new section's body
+            current_texts.append(text)
         else:
             current_texts.append(text)
 
-    # Save last section
+    # FIX 2: always flush the last section
     if current_texts:
         sections.append({
             "heading": current_heading,
             "text":    "\n".join(current_texts).strip(),
         })
+
+    # ✅ FIX 3 (was debug → now info): always visible in default INFO log level
+    logger.info(
+        "  Page '%s': %d blocks → %d sections %s",
+        title,
+        len(blocks),
+        len(sections),
+        [(s["heading"][:40], len(s["text"])) for s in sections],
+    )
 
     return {
         "page_id":    page["id"],
@@ -258,6 +347,7 @@ def _extract_page_content(page: dict, blocks: list[dict]) -> dict:
 def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
     """
     Split text into overlapping chunks, preferring paragraph/sentence boundaries.
+    Short text that fits within one chunk is returned as-is (single-item list).
     """
     if not text or len(text) < MIN_CHUNK_LEN:
         return [text] if text.strip() else []
@@ -330,7 +420,7 @@ def _embed_and_upsert(chunks_batch: list[dict], collection) -> int:
     """
     Embed a batch of chunk dicts and upsert into ChromaDB.
     Each chunk dict has: id, text, metadata.
-    Returns number of chunks upserted.
+    Returns number of chunks successfully upserted.
     """
     if not chunks_batch:
         return 0
@@ -368,22 +458,32 @@ async def ingest_from_notion(force: bool = False) -> dict:
       Notion pages → extract → chunk → embed → ChromaDB upsert
 
     Args:
-        force: if True, skip the Redis lock check (allow re-ingest)
+        force: if True, skip the Redis lock check (allow re-ingest).
+               Always use force=True during development.
 
     Returns:
-        dict with total_docs, total_chunks, elapsed_s, skipped
+        dict with status, total_docs, total_chunks, elapsed_s, and optionally skipped
     """
     # ── Lock check ──────────────────────────────────────────────────────────────
     if not force:
         locked = await cache.exists(INGEST_LOCK_KEY)
         if locked:
-            logger.warning("Ingest already in progress — skipping (use force=True to override)")
+            logger.warning(
+                "Ingest lock is active — skipping. "
+                "If a previous ingest crashed, clear it with: "
+                "redis-cli DEL %s  OR call ingest with force=True",
+                INGEST_LOCK_KEY,
+            )
             return {
                 "status":       "skipped",
                 "reason":       "ingest_locked",
                 "total_docs":   0,
                 "total_chunks": 0,
             }
+    else:
+        # force=True: clear any stale lock before starting
+        await cache.delete(INGEST_LOCK_KEY)
+        logger.info("force=True — cleared any stale ingest lock")
 
     # Set lock
     await cache.set(INGEST_LOCK_KEY, "1", ttl=INGEST_LOCK_TTL)
@@ -393,12 +493,20 @@ async def ingest_from_notion(force: bool = False) -> dict:
         collection = _get_collection()
 
         # ── Step 1: Fetch pages ────────────────────────────────────────────────
-        logger.info("Fetching pages from Notion...")
+        logger.info("═══ INGEST START ═══")
+        logger.info("Fetching pages from Notion (DB: %s)...", _get_db_id())
         loop  = asyncio.get_event_loop()
         pages = await loop.run_in_executor(None, _fetch_all_notion_pages)
 
         if not pages:
-            logger.warning("No pages returned from Notion")
+            logger.warning(
+                "No pages returned from Notion.\n"
+                "  → Fix 1: Make sure NOTION_DATABASE_ID in .env is ONLY the UUID:\n"
+                "           NOTION_DATABASE_ID=32212206f265800cb9d1fa5bd2f4566f\n"
+                "           (no ?v=... suffix, no full URL)\n"
+                "  → Fix 2: In Notion open the database → ... menu → Connections\n"
+                "           → confirm your integration is listed there."
+            )
             return {
                 "status":       "done",
                 "total_docs":   0,
@@ -411,6 +519,7 @@ async def ingest_from_notion(force: bool = False) -> dict:
         all_chunks:  list[dict] = []
 
         # ── Step 2: Extract + chunk ────────────────────────────────────────────
+        logger.info("Extracting + chunking %d pages...", total_docs)
         for page in pages:
             page_id = page["id"]
             try:
@@ -426,10 +535,11 @@ async def ingest_from_notion(force: bool = False) -> dict:
             version    = content["version"]
             url        = content["url"]
 
+            page_chunk_count = 0
             for section in content["sections"]:
-                heading = section["heading"]
-                text    = section["text"]
-                chunks  = _chunk_text(text)
+                heading  = section["heading"]
+                text     = section["text"]
+                chunks   = _chunk_text(text)
                 citation = _format_citation(title, heading, doc_type)
 
                 for idx, chunk_text in enumerate(chunks):
@@ -449,10 +559,24 @@ async def ingest_from_notion(force: bool = False) -> dict:
                             "source_url":     url,
                         },
                     })
+                    page_chunk_count += 1
 
-        logger.info("Prepared %d chunks from %d pages", len(all_chunks), total_docs)
+            logger.info(
+                "  ✔ Page '%s': %d sections → %d chunks",
+                title, len(content["sections"]), page_chunk_count,
+            )
+
+        logger.info("Prepared %d total chunks from %d pages", len(all_chunks), total_docs)
+
+        if not all_chunks:
+            logger.warning(
+                "All pages extracted but produced 0 chunks. "
+                "Possible causes: pages have no text content, or all text was below "
+                "MIN_CHUNK_LEN=%d characters.", MIN_CHUNK_LEN
+            )
 
         # ── Step 3: Embed + upsert in batches ──────────────────────────────────
+        num_batches = (len(all_chunks) + BATCH_EMBED_SIZE - 1) // BATCH_EMBED_SIZE
         for i in range(0, len(all_chunks), BATCH_EMBED_SIZE):
             batch        = all_chunks[i : i + BATCH_EMBED_SIZE]
             upserted     = await loop.run_in_executor(
@@ -460,9 +584,9 @@ async def ingest_from_notion(force: bool = False) -> dict:
             )
             total_chunks += upserted
             logger.info(
-                "Embedded batch %d/%d — %d/%d chunks upserted",
+                "  Embedded batch %d/%d — %d/%d chunks upserted so far",
                 i // BATCH_EMBED_SIZE + 1,
-                (len(all_chunks) + BATCH_EMBED_SIZE - 1) // BATCH_EMBED_SIZE,
+                num_batches,
                 total_chunks,
                 len(all_chunks),
             )
@@ -479,7 +603,7 @@ async def ingest_from_notion(force: bool = False) -> dict:
         await cache.set(INGEST_META_KEY, meta)
 
         logger.info(
-            "Ingest complete: %d docs, %d chunks, %.1fs",
+            "═══ INGEST COMPLETE: %d docs, %d chunks, %.1fs ═══",
             total_docs, total_chunks, elapsed,
         )
         return {"status": "done", **meta}
@@ -489,5 +613,5 @@ async def ingest_from_notion(force: bool = False) -> dict:
         raise
 
     finally:
-        # Always release the lock
+        # Always release the lock regardless of success or failure
         await cache.delete(INGEST_LOCK_KEY)

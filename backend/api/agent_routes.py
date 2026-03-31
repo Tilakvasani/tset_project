@@ -389,7 +389,7 @@ async def create_ticket(req: TicketCreateRequest):
 async def flush_dedup():
     """Clear the duplicate-detection cache (exact hashes + embeddings)."""
     try:
-        from backend.services.rag.ticket_dedup import flush_dedup_cache
+        from backend.rag.ticket_dedup import flush_dedup_cache
         await flush_dedup_cache()
         return {"success": True, "message": "Dedup cache flushed."}
     except Exception as e:

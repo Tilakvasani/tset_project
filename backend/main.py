@@ -68,11 +68,11 @@ from backend.api.routes import router as docforge_router
 app.include_router(docforge_router, prefix="/api")
 
 # ── RAG routes (ingest, ask, status, eval, scores) ────────────────────────────
-from backend.services.rag.rag_routes import router as rag_router
+from backend.api.rag_routes import router as rag_router
 app.include_router(rag_router, prefix="/api")
 
 # ── Agent routes (tickets, memory) ────────────────────────────────────────────
-from backend.services.rag.agent_routes import router as agent_router
+from backend.api.agent_routes import router as agent_router
 app.include_router(agent_router, prefix="/api")
 
 

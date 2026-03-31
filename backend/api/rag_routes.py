@@ -31,10 +31,10 @@ from pydantic import BaseModel
 from backend.core.logger import logger
 from backend.core.config import settings
 from backend.services.redis_service import cache
-from backend.services.rag.rag_service import tool_search, _save_turn
-from backend.services.rag.ragas_scorer import score as ragas_score
-from backend.services.rag.ingest_service import COLLECTION_NAME, ingest_from_notion
-from backend.services.rag.agent_graph import run_agent
+from backend.rag.rag_service import tool_search, _save_turn
+from backend.rag.ragas_scorer import score as ragas_score
+from backend.rag.ingest_service import COLLECTION_NAME, ingest_from_notion
+from backend.agents.agent_graph import run_agent
 
 router = APIRouter(prefix="/rag", tags=["RAG"])
 

@@ -24,13 +24,13 @@ _LEVEL_EMOJI = {
 
 # Shorten noisy module names for cleaner output
 _MODULE_ALIASES = {
-    "backend.services.rag.agent_graph":   "agent",
-    "backend.services.rag.agent_routes":  "routes",
-    "backend.services.rag.rag_service":   "rag",
-    "backend.services.rag.rag_routes":    "rag_api",
-    "backend.services.rag.ticket_dedup":  "dedup",
-    "backend.services.rag.ragas_scorer":  "ragas",
-    "backend.services.rag.ingest_service":"ingest",
+    "backend.agents.agent_graph":   "agent",
+    "backend.api.agent_routes":    "routes",
+    "backend.rag.rag_service":      "rag",
+    "backend.api.rag_routes":       "rag_api",
+    "backend.rag.ticket_dedup":     "dedup",
+    "backend.rag.ragas_scorer":     "ragas",
+    "backend.rag.ingest_service":    "ingest",
     "backend.services.redis_service":     "redis",
     "backend.core.logger":               "core",
     "ai-doc-generator":                   "app",

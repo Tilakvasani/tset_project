@@ -23,7 +23,7 @@ from backend.schemas.document_schema import (
 )
 
 # Import DOC_STRUCTURE_METADATA + ALL prompts from templates.py (single source of truth)
-from prompts.prompts import (
+from backend.prompts.prompts import (
     DOC_STRUCTURE_METADATA,
     TEXT_QUESTIONS_PROMPT,
     TABLE_QUESTIONS_PROMPT,
