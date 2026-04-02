@@ -12,13 +12,41 @@ Tools:
   tool_refine()        — HyDE-based summary generation
   tool_full_doc()      — full document retrieval
 
-Redis fix (was broken):
-  _answer_key() was defined but never used.  tool_search() now does:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CHANGES IN THIS VERSION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SHIELD REMOVED — tool_search() no longer overrides the LLM answer.
+
+  OLD (broken):
+    answer = llm.invoke(...)
+    if "could not find" in answer.lower():
+        answer = "I could not find information..."   # ← FORCED OVERRIDE
+  
+  This was causing valid answers to be suppressed whenever the LLM used
+  ANY hedging phrase like "I could not find the exact clause but the policy
+  says 30 days..." — the entire answer got replaced with a blank not-found.
+
+  NEW (fixed):
+    The LLM decides from the retrieved context. If chunks exist, the LLM
+    answers from them. The early-return guard only fires when literally
+    ZERO chunks pass the score threshold — i.e., nothing was retrieved at all.
+
+ALL 6 PROMPTS IMPROVED:
+  ANSWER_PROMPT       — "partial answer" rule; no more forced not-found override
+  HYDE_PROMPT         — Turabit-specific HR/legal terms for better retrieval
+  SUMMARY_PROMPT      — raised word limit; added partial-context rule
+  ANALYSIS_PROMPT     — "use best available evidence; do not refuse if partial"
+  COMPARE_PROMPT      — "do not discard partial evidence"
+  MULTI_COMPARE_PROMPT— same; plus per-doc partial-content handling
+  EXPAND_PROMPT       — 4 variants (was 3); includes informal/Hinglish phrasings
+
+Redis fix (was broken in older version):
+  _answer_key() is now actually used. tool_search() does:
     1. cache.get(answer_key)  → return cached answer immediately
     2. on miss: run LLM, then cache.set(answer_key, result, TTL_ANSWER)
   Retrieval results are still cached via _retrieval_key (unchanged).
 """
-
 
 import hashlib
 import json
@@ -35,13 +63,13 @@ TTL_SESSION     = 86400
 TTL_ANSWER      = 3600
 
 
-# ── Prompts ───────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  PROMPTS
+# ══════════════════════════════════════════════════════════════════════════════
 
 ANSWER_PROMPT = """\
-You are CiteRAG — a business document assistant for turabit.
-Your answers are based strictly on the context provided below.
-If the information is not present in the context, say:
-"I could not find information about this in the available documents."
+You are CiteRAG — Turabit's internal document assistant.
+Answer the question using the context documents provided below.
 
 {history}
 
@@ -50,33 +78,47 @@ Context:
 
 Question: {question}
 
-Rules:
-- Answer only what is asked — skip unrequested analysis
-- Begin directly with the fact or answer — no intro phrases like "Based on the context..."
-- Always include specific values from the documents: numbers, names, dates, percentages
-- After each key fact, cite the source: [Employee Handbook § Leave Policy]
-- Never omit specific values that exist in the context
-- Never repeat the question back in your answer
-- If the answer requires steps or items, use a numbered list — never inline as prose
-- If the context partially answers the question, answer what IS there and state what is missing
-- If something is not in the context, say so — never fill gaps with generic knowledge
+ANSWER RULES — follow every rule strictly:
 
-Output format — match to question type:
+1. USE WHAT IS THERE
+   - Answer from the context as completely as possible.
+   - If the context PARTIALLY answers the question, give the partial answer and
+     state what is missing in one sentence: e.g. "The document covers X but does
+     not specify Y."
+   - Do NOT say "I could not find" if ANY relevant information is present in the
+     context, even if it is incomplete or indirect.
 
-Single fact → 1-2 sentences with the exact value + [Document § Section]
+2. FORMAT BY QUESTION TYPE
+   Single fact  → 1-2 sentences with the exact value + [Document § Section]
+   What/How/Why → 2-4 sentences with key facts and inline citations
+   List / Steps → numbered list, one citation per item — never as inline prose
+   Yes / No     → start with YES or NO, then 1-2 supporting sentences
+   Person lookup→ state their name, role, department, and any details present
 
-What / How / Why → 2-4 sentences with key facts and source citations
+3. CITATIONS — MANDATORY
+   - After each key fact write the source in brackets: [Employee Handbook § Leave Policy]
+   - Never skip citations when the source is identifiable from the context.
 
-List → bullet points, one citation per item
+4. EXACT VALUES
+   - Always include exact numbers, dates, names, percentages, durations from context.
+   - Never paraphrase or approximate a number — use the exact value as written.
 
-Yes / No → open with YES or NO, then 1-2 supporting sentences from the context
+5. WHEN TRULY NOT IN CONTEXT
+   - Say "I could not find information about this in the available documents."
+     ONLY if the context contains absolutely nothing relevant to the question.
+   - Never fill gaps with general knowledge, assumptions, or industry standards.
 
-Analysis / Audit → structured sections (Contradictions / Gaps / Ambiguities) only when asked
+6. STYLE
+   - Begin directly with the fact or answer.
+   - No intro phrases: "Based on the context...", "According to...", "Certainly!".
+   - Never repeat the question back in the answer.
+   - Keep answers concise and factual.
 
 Answer:"""
 
+
 COMPARE_PROMPT = """\
-You are CiteRAG — a document analyst for turabit.
+You are CiteRAG — a document analyst for Turabit.
 Compare the two documents on the specific question below.
 
 Question: {question}
@@ -87,26 +129,27 @@ Content from {doc_a}:
 Content from {doc_b}:
 {content_b}
 
-Rules:
-- If a document or clause is missing, state it once in one sentence — do not repeat it
-- Never say "Document B mirrors Document A" — state each finding with its actual value
-- Each document section: 3-5 bullets of specific facts only (numbers, dates, clause wording)
-- Comparison table cells must contain specific values — never just "Yes/No" or "Same"
-- If a clause is identical in both documents, write the actual shared value in the cell
-- GAP IDENTIFIED: skip entirely if there is no real gap — do not invent one
-- KEY DIFFERENCE: name the specific clause or value that differs, not a vague category
-- SUMMARY: concrete recommendation only — not a restatement of findings already listed
+COMPARISON RULES:
+- Use ALL content provided — do not discard partial or indirect evidence.
+- If one document's content is limited or missing, use what is available and note it is partial.
+- Each document section: 3-5 bullets of specific facts (numbers, dates, clause wording).
+- If a clause is identical in both, write the ACTUAL shared value — never just "Same".
+- Never say "Document B mirrors Document A" — state each finding with its own actual value.
+- COMPARISON TABLE cells must contain specific values — never "Yes/No" or "Same".
+- GAP IDENTIFIED: skip this entire block if there is no real gap — never invent one.
+- KEY DIFFERENCE: name the specific clause or value, not a vague category.
+- SUMMARY: one concrete recommendation — not a restatement of findings above.
 
-Respond in this format:
+Respond in EXACTLY this format (no extra sections, no reordering):
 
 FINAL ANSWER
-[1-2 sentences. Direct answer to the question. If a document is missing, say so and stop padding.]
+[1-2 sentences. Direct answer. If a document is missing a clause, say so and stop padding.]
 
 DOCUMENT A -- {doc_a}
-[3-5 bullets: exact facts, numbers, durations, clause wording. "Clause not present" if missing.]
+[3-5 bullets: exact facts, numbers, durations, clause wording. Write "Clause not present" if missing.]
 
 DOCUMENT B -- {doc_b}
-[3-5 bullets: exact facts, numbers, durations, clause wording. "Clause not present" if missing.]
+[3-5 bullets: exact facts, numbers, durations, clause wording. Write "Clause not present" if missing.]
 
 COMPARISON TABLE
 | Aspect | {doc_a} | {doc_b} |
@@ -117,7 +160,7 @@ KEY DIFFERENCE:
 [One sentence: the single most important difference, or "No substantive difference found."]
 
 GAP IDENTIFIED:
-What: [specific missing clause or risk — skip if no real gap]
+What: [specific missing clause or risk — OMIT this entire block if no real gap exists]
 Risk: [one concrete legal/operational impact]
 Severity: [🔴 HIGH / 🟡 MEDIUM / 🟢 LOW]
 
@@ -130,7 +173,7 @@ SUMMARY: [2 sentences max. Main finding and recommended action.]"""
 
 
 MULTI_COMPARE_PROMPT = """\
-You are CiteRAG — a document analyst for turabit.
+You are CiteRAG — a document analyst for Turabit.
 Compare ALL the listed documents on the specific question below.
 
 Question: {question}
@@ -138,19 +181,21 @@ Question: {question}
 Documents provided:
 {contents}
 
-Rules:
-- For each document, give 3-5 bullets of specific facts only (numbers, dates, exact clause wording)
-- Never summarise by saying "same as above" — always state the actual value from that document
-- Comparison table cells must contain the real value found, never just "Same" or "Yes"
-- If a clause is identical across all documents, write the actual shared value in every cell
-- GAP IDENTIFIED: skip entirely if there is no real gap — do not invent one
-- KEY DIFFERENCE: name the specific clause or value that differs, if any
-- FINAL ANSWER: a direct 1-2 sentence yes/no verdict answering the question
+COMPARISON RULES:
+- Use ALL content provided — do not discard partial or indirect evidence.
+- For each document: 3-5 bullets of specific facts (numbers, dates, exact clause wording).
+- If one document's content is limited, note it is partial and use what is available.
+- Never say "same as above" — always write the actual value for that document.
+- If a clause is identical across all documents, write the actual shared value in every cell.
+- COMPARISON TABLE cells must contain real values — never "Same" or "Yes".
+- GAP IDENTIFIED: write "None." if there is no real gap — never invent one.
+- KEY DIFFERENCE: name the specific clause or value that differs, if any.
+- FINAL ANSWER: a direct 1-2 sentence verdict answering the question.
 
-Respond in this format:
+Respond in EXACTLY this format:
 
 FINAL ANSWER
-[1-2 sentences. Direct answer to the question. Include the specific value (e.g. "30 days") if uniform.]
+[1-2 sentences. Direct answer. Include the specific value (e.g. "30 days") if uniform.]
 
 {doc_sections}
 
@@ -160,29 +205,49 @@ COMPARISON TABLE
 | [aspect] | {doc_cells} |
 
 KEY DIFFERENCE:
-[One sentence naming the single most important difference, or "No substantive difference found."]
+[One sentence naming the most important difference, or "No substantive difference found."]
 
 GAP IDENTIFIED:
-[State "None." if there is no real gap, otherwise: What / Risk / Severity]
+[Write "None." if no real gap. Otherwise: What / Risk / Severity]
 
 SUMMARY: [2 sentences max. Main finding and recommended action.]"""
 
 
-
 HYDE_PROMPT = """\
-Write a brief factual description (2-3 sentences) as if it were a passage from a corporate HR policy,
-legal contract, or finance document at a software company. Cover: {question}
-Use specific language: include plausible numbers, durations, or conditions where relevant.
-Return ONLY the description. No preamble, no conversational filler, no bullet points."""
+Write a brief factual description (2-4 sentences) as if it were a passage from a
+corporate HR policy, legal contract, or finance document at a software company.
+
+Topic: {question}
+
+Include where relevant:
+- Specific numbers, durations, percentages, or conditions
+- Policy names, clause names, or document section titles
+- Employee roles, departments, or hierarchy levels
+- Turabit-specific HR terms: notice period, probation, appraisal, reimbursement,
+  leave entitlement, carry-forward, salary structure, working hours, overtime,
+  resignation, contract terms, confidentiality, non-disclosure, indemnity
+
+Return ONLY the description. No preamble, no filler, no bullet points."""
+
 
 SUMMARY_PROMPT = """\
-You are CiteRAG — a professional document analyst for turabit.
-Write a structured, scannable summary. Use ONLY the context below.
+You are CiteRAG — a professional document analyst for Turabit.
+Write a structured, scannable summary using ONLY the context below.
 
 Context:
 {context}
 
 Topic/Question: {question}
+
+SUMMARY RULES:
+- If the context is partial, summarise what IS there — do not pad with generic content.
+- Every KEY FUNCTION must include at least one specific value: number, name, date, duration, or condition.
+- Do not repeat the same fact across multiple KEY FUNCTION sections.
+- CONCLUSION must state the practical outcome for an employee — not just the document's purpose.
+- Under 300 words total.
+- No bullet points inside sections — write in prose sentences.
+- No intro or outro phrases ("Here is a summary of...", "In conclusion...").
+- Skip any section that has no real content in the context.
 
 Output format — follow EXACTLY:
 
@@ -192,7 +257,7 @@ SUMMARY
 KEY FUNCTIONS
 
 **1. [Function Name]**
-[1-2 sentences. Real facts: names, numbers, conditions, timelines. No vague labels.]
+[1-2 sentences. Real facts: names, numbers, conditions, timelines.]
 
 **2. [Function Name]**
 [1-2 sentences. Real facts only.]
@@ -200,27 +265,16 @@ KEY FUNCTIONS
 **3. [Function Name]**
 [1-2 sentences. Real facts only.]
 
-(Continue up to 8 functions maximum)
+(Continue up to 8 functions maximum — only include functions with actual content from context)
 
 CONCLUSION
-[1 sentence. What this document/policy achieves overall.]
-
-RULES:
-- Under 220 words total
-- No bullet points inside sections
-- No intro or outro phrases
-- Every section must contain real content — skip if not in context
-- If the context is sparse, output a short summary. DO NOT pad with generic industry information
-- Short, structured, scannable — not a paragraph essay
-- Every KEY FUNCTION must include at least one specific value: a number, name, date, duration, or condition
-- Do not repeat the same fact across multiple KEY FUNCTION sections
-- CONCLUSION must state the practical outcome for an employee, not just restate the document purpose
+[1 sentence. Practical outcome for an employee.]
 
 Summary:"""
 
 
 ANALYSIS_PROMPT = """\
-You are CiteRAG — a senior legal and business document analyst for turabit.
+You are CiteRAG — a senior legal and business document analyst for Turabit.
 Analyze the provided documents and answer the question precisely.
 
 CRITICAL DEFINITIONS — apply strictly:
@@ -230,7 +284,7 @@ CONTRADICTION: Two statements that CANNOT both be true simultaneously.
   NOT a contradiction: vague wording, different terminology, missing info.
 
 INCONSISTENCY: Same concept, different wording — not logically conflicting.
-GAP: A standard clause or section that is completely missing.
+GAP: A standard clause or section that is completely absent.
 AMBIGUITY: Wording that is unclear or interpretable in multiple ways.
 
 Document content:
@@ -238,62 +292,69 @@ Document content:
 
 Question: {question}
 
+ANALYSIS RULES:
+- Use ALL available evidence — do not refuse to analyze if context is partial.
+- If context is limited, analyze what IS there and note specifically what is missing.
+- Only report findings that are actually supported by the documents.
+- Cite exact [Document > Section] for every single finding.
+- Do not invent or hypothesize risks beyond what the documents clearly imply.
+- Flag undefined terms (reasonable, promptly, material breach) as AMBIGUITIES.
+- Flag absent standard clauses (indemnity, liability cap, force majeure) as GAPS.
+- Cross-check ALL documents, not just the first match.
+- Each finding must quote or closely paraphrase the actual clause wording.
+- Severity must be justified by a real legal or operational consequence.
+- CONCLUSION must name the single highest-priority action — do not summarise all findings again.
+- If FINAL ANSWER is YES or NO, the very first word of the response must be YES or NO.
+
 FORMAT — include ONLY sections with actual findings:
 
 FINAL ANSWER
 [1-2 sentences. Direct YES/NO or overall verdict answering the question.]
 
 ## CONTRADICTIONS
-[If none: **No true contradictions found.**]
+[If none found: **No true contradictions found.**]
 
 ## INCONSISTENCIES
-[Skip if none]
+[Skip this section entirely if none found]
 
 ## GAPS
-[Skip if none]
+[Skip this section entirely if none found]
 
 ## AMBIGUITIES
-[Skip if none]
+[Skip this section entirely if none found]
 
-For EACH finding:
-- **What:** [specific issue — quote exact wording from document]
+For EACH finding, use this structure:
+- **What:** [specific issue — quote or closely paraphrase exact wording]
   **Where:** [document name] > [section name]
   **Risk:** [concrete legal or operational impact]
   **Severity:** 🔴 HIGH / 🟡 MEDIUM / 🟢 LOW
-  **Severity Reason:** [1 sentence explaining why this severity level]
+  **Severity Reason:** [1 sentence explaining why]
   **Fix:** [concrete, actionable recommendation]
 
 ## CONCLUSION
-[2-3 sentences. Overall assessment: how serious? What is the priority action?]
-
-RULES:
-- Always write FINAL ANSWER first before any section headers
-- FINAL ANSWER: YES/NO for yes/no questions, or a direct verdict
-- Only report what is in the documents — no hallucination
-- Cite the exact [Document > Section] for every single finding
-- Do not invent or hypothesize risks. State standard operational risks only if clearly linked to a gap
-- Cross-check ALL documents, not just the first match
-- Flag undefined terms (reasonable, promptly, material breach) as AMBIGUITIES
-- Flag missing standard clauses (indemnity, liability cap, force majeure) as GAPS
-- CONCLUSION must name the single highest-priority action, not summarise all findings again
-- If FINAL ANSWER is YES or NO, the first word of the response must literally be YES or NO
-- Each finding must quote the exact clause wording — paraphrasing is not acceptable
-- Severity must be justified by a real legal or operational consequence, not assigned by gut feel
+[2-3 sentences. How serious overall? What is the single priority action?]
 
 Analysis:"""
 
+
 EXPAND_PROMPT = """\
-Generate 3 alternative search queries for the following question.
-Each query should use different vocabulary but find the same information.
-Return ONLY the 3 queries, one per line, no numbering, no explanation.
+Generate 4 alternative search queries for the following question.
+Use different vocabulary and phrasing in each — the goal is to find the same
+information using different words that might appear in corporate documents.
+Include at least one simpler or more informal phrasing (e.g. how a user might
+type it casually, or a Hinglish/transliterated version if the question involves
+HR or policy topics common in Indian companies).
+Return ONLY the 4 queries, one per line. No numbering, no explanation.
 
 Question: {question}"""
 
 
-# ── Singleton clients (created once, reused) ────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  SINGLETON CLIENTS  (created once, reused)
+# ══════════════════════════════════════════════════════════════════════════════
 
-_llm_instance = None
-_embedder_instance = None
+_llm_instance        = None
+_embedder_instance   = None
 _collection_instance = None
 
 
@@ -337,7 +398,9 @@ def _get_collection():
     return _collection_instance
 
 
-# ── Cache helpers ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  CACHE HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _retrieval_key(query: str, filters: dict, top_k: int) -> str:
     raw = json.dumps({"q": query, "f": filters, "k": top_k}, sort_keys=True)
@@ -359,9 +422,8 @@ async def _get_history(session_id: str) -> str:
     if not data:
         return ""
     lines = ["Previous conversation:"]
-    # data is [{role, content}] — pick last 4 user+assistant pairs
     for msg in data[-8:]:
-        role = msg.get("role", "")
+        role    = msg.get("role", "")
         content = (msg.get("content") or "")[:200]
         if role == "user":
             lines.append(f"User: {content}")
@@ -383,11 +445,13 @@ async def _save_turn(session_id: str, q: str, a: str):
     await cache.set(key, data[-40:], ttl=TTL_SESSION)   # keep last 20 turns
 
 
-# ── Retriever ─────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  RETRIEVER
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def _retrieve_single(query: str, filters: dict, top_k: int,
                             embedder, collection) -> list:
-    """Single query retrieval."""
+    """Single query retrieval against ChromaDB."""
     count = collection.count()
     if count == 0:
         return []
@@ -454,11 +518,11 @@ async def _retrieve(query: str, filters: dict, top_k: int = 8) -> list:
             expanded = _get_llm().invoke(
                 EXPAND_PROMPT.format(question=query)
             ).content.strip()
-            variants = [v.strip() for v in expanded.splitlines() if v.strip()][:3]
+            variants = [v.strip() for v in expanded.splitlines() if v.strip()][:4]
             logger.info("🌿 [Expand] Query expanded to: %s", variants)
 
             seen_ids = {c["notion_page_id"] + c["heading"] for c in all_chunks}
-            # PERF: run variant retrievals in parallel instead of sequential
+            # PERF: run variant retrievals in parallel
             variant_results = await asyncio.gather(
                 *[_retrieve_single(v, filters, 4, embedder, collection) for v in variants],
                 return_exceptions=True,
@@ -521,7 +585,7 @@ async def _retrieve(query: str, filters: dict, top_k: int = 8) -> list:
             logger.info("⚖️ [Retrieve] After diversity filter: %d chunks from %d docs",
                         len(final), len({c["doc_title"] for c in final}))
 
-    # Table recovery
+    # Table recovery — if chunks reference a table/schedule, fetch the table chunk too
     _table_ref_phrases = [
         "as per the table", "refer to the table", "table below",
         "outlined below", "as follows", "see the table", "per the schedule",
@@ -585,20 +649,37 @@ def _confidence(chunks: list) -> str:
     return "high" if avg >= 0.60 else "medium" if avg >= 0.40 else "low"
 
 
-# ── Tools ─────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  TOOLS
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def tool_search(question: str, filters: dict,
                       session_id: str, top_k: int = 8) -> dict:
-    # ── FIX: Check Redis answer cache before doing any work ───────────────────
+    """
+    Vector search + LLM answer.
+
+    ── SHIELD REMOVED ──────────────────────────────────────────────────────────
+    The old code had a hard override that replaced the LLM's answer with
+    "I could not find..." whenever the response contained the phrase
+    "could not find". This caused valid, partial answers to be silently
+    dropped — e.g. when the LLM said "I could not find the exact date
+    but the policy states 30 days..." the whole answer was discarded.
+
+    Now: the LLM decides from the retrieved context. If there are chunks,
+    the LLM answers from them — partial or complete. The early-return guard
+    only fires when literally ZERO chunks pass the score threshold.
+    ────────────────────────────────────────────────────────────────────────────
+    """
+    # ── Redis answer cache ────────────────────────────────────────────────────
     a_key  = _answer_key(question, filters)
     cached = await cache.get(a_key)
     if cached is not None:
         logger.info("⚡ [Cache HIT] answer for %r", question[:60])
-        # node_save_history() in agent_graph handles history persistence
         return cached
 
     chunks = await _retrieve(question, filters, top_k)
 
+    # ── HR policy second-pass ─────────────────────────────────────────────────
     _hr_policy_signals = [
         "leave", "policy", "handbook", "employee", "hr ", "salary",
         "working hours", "holiday", "benefit", "attendance", "overtime",
@@ -633,17 +714,18 @@ async def tool_search(question: str, filters: dict,
         logger.info("HR second-pass: now %d chunks from %d docs",
                     len(chunks), len({c["doc_title"] for c in chunks}))
 
-    # Build context (sync, fast) and fetch history in parallel
+    # ── Build context + fetch history in parallel ─────────────────────────────
     context = _build_context(chunks)
     history = await _get_history(session_id)
 
     # ── Early not-found guard ─────────────────────────────────────────────────
-    # If no chunks pass the quality threshold, skip the LLM entirely and return
-    # a clean one-liner instead of a padded "not found" essay.
+    # INTENTIONALLY NARROW: only fires when ZERO chunks pass MIN_SCORE.
+    # This means "nothing was retrieved at all" — empty knowledge base or
+    # completely out-of-scope question. When chunks DO exist, we always
+    # let the LLM answer from them (shield removed).
     quality_chunks = [c for c in chunks if c.get("score", 0) >= MIN_SCORE]
     if not quality_chunks:
         not_found_answer = "I could not find information about this in the available documents."
-        # node_save_history() in agent_graph handles history persistence
         result = {
             "answer":     not_found_answer,
             "citations":  _citations(chunks),
@@ -651,21 +733,18 @@ async def tool_search(question: str, filters: dict,
             "tool_used":  "search",
             "confidence": "low",
         }
-        # ── FIX: Caching chunks even for not-found responses ──────────────────
-        # This ensures the "Show Sources" button appears even when we 
-        # fail to find a confident answer.
         await cache.set(a_key, result, ttl=600)
         return result
 
+    # ── LLM generates the answer from retrieved context ───────────────────────
     response = await _get_llm().ainvoke(
         ANSWER_PROMPT.format(history=history, context=context, question=question)
     )
     answer = response.content.strip()
+
+    # Confidence: if LLM itself says not found, mark low confidence.
+    # But we no longer REPLACE the answer — the LLM's response stands as-is.
     not_found = "could not find" in answer.lower()
-    if not_found:
-        # LLM said not found but we had chunks — return clean message
-        answer = "I could not find information about this in the available documents."
-    # node_save_history() in agent_graph handles history persistence
 
     result = {
         "answer":     answer,
@@ -675,10 +754,7 @@ async def tool_search(question: str, filters: dict,
         "confidence": "low" if not_found else _confidence(chunks),
     }
 
-    # ── FIX: Write to Redis answer cache (include chunks for 'Show Sources') ─
-    # The 'Show Sources' button in the UI depends on having the 'chunks' key.
-    # We now cache the full result so repeated hits still show citations.
-    ttl = 600 if not_found else TTL_ANSWER        # shorter TTL for not-found
+    ttl = 600 if not_found else TTL_ANSWER
     await cache.set(a_key, result, ttl=ttl)
     logger.info("💾 [Cache SET] answer for %r (ttl=%ds)", question[:60], ttl)
 
@@ -689,15 +765,15 @@ async def tool_full_doc(question: str, filters: dict,
                         session_id: str) -> dict:
     """For full document requests — retrieve more chunks with higher top_k."""
     # PERF: run retrieval and history in parallel
-    chunks_coro = _retrieve(question, filters, top_k=15)
+    chunks_coro  = _retrieve(question, filters, top_k=15)
     history_coro = _get_history(session_id)
     chunks, history = await asyncio.gather(chunks_coro, history_coro)
 
-    context = _build_context(chunks)
-    prompt  = ANSWER_PROMPT.format(
+    context  = _build_context(chunks)
+    prompt   = ANSWER_PROMPT.format(
         history=history, context=context, question=question)
     response = await _get_llm().ainvoke(prompt)
-    answer = response.content.strip()
+    answer   = response.content.strip()
     not_found = "could not find" in answer.lower()
     # node_save_history() in agent_graph handles history persistence
     return {
@@ -738,7 +814,7 @@ async def tool_refine(question: str, filters: dict,
 async def tool_compare(question: str, doc_a: str, doc_b: str,
                        filters: dict, session_id: str, top_k: int = 6) -> dict:
 
-    _boost = "contract agreement clause legal terms obligations"
+    _boost  = "contract agreement clause legal terms obligations"
     query_a = f"{question} {_boost} {doc_a}"
     query_b = f"{question} {_boost} {doc_b}"
 
@@ -746,7 +822,7 @@ async def tool_compare(question: str, doc_a: str, doc_b: str,
     chunks_a, chunks_b, history = await asyncio.gather(
         _retrieve(query_a, filters, top_k * 3),
         _retrieve(query_b, filters, top_k * 3),
-        _get_history(session_id),  # PERF: was fetched separately after retrieval
+        _get_history(session_id),
     )
 
     def filter_doc(chunks, target_title, other_title):
@@ -758,7 +834,7 @@ async def tool_compare(question: str, doc_a: str, doc_b: str,
         if exact:
             return exact[:top_k]
         # Step 2: partial word match on target keywords, still excluding other
-        words = [w for w in target_title.lower().split() if len(w) > 3]
+        words   = [w for w in target_title.lower().split() if len(w) > 3]
         partial = [c for c in chunks
                    if any(w in c["doc_title"].lower() for w in words)
                    and other_title.lower() not in c["doc_title"].lower()]
@@ -769,8 +845,8 @@ async def tool_compare(question: str, doc_a: str, doc_b: str,
                     if other_title.lower() not in c["doc_title"].lower()]
         return sorted(excluded or chunks, key=lambda x: x["score"], reverse=True)[:top_k]
 
-    chunks_a = filter_doc(chunks_a, doc_a, doc_b)
-    chunks_b = filter_doc(chunks_b, doc_b, doc_a)
+    chunks_a  = filter_doc(chunks_a, doc_a, doc_b)
+    chunks_b  = filter_doc(chunks_b, doc_b, doc_a)
     content_a = _build_context(chunks_a)
     content_b = _build_context(chunks_b)
 
@@ -813,13 +889,12 @@ async def tool_compare(question: str, doc_a: str, doc_b: str,
         "side_b":      side_b,
         "comp_table":  comp_table,
         "summary":     summary,
-        "doc_a":      doc_a,
-        "doc_b":      doc_b,
-        "citations":  _citations(all_chunks),
-        "chunks":     all_chunks,
-        "tool_used":  "compare",
+        "doc_a":       doc_a,
+        "doc_b":       doc_b,
+        "citations":   _citations(all_chunks),
+        "chunks":      all_chunks,
+        "tool_used":   "compare",
     }
-    
 
 
 async def tool_multi_compare(
@@ -837,16 +912,16 @@ async def tool_multi_compare(
 
     # ── 1. Parallel retrieval for all docs ───────────────────────────────────
     async def _retrieve_for_doc(doc_name: str):
-        q = f"{question} {_boost} {doc_name}"
+        q      = f"{question} {_boost} {doc_name}"
         chunks = await _retrieve(q, filters, top_k * 3)
         # Filter to only chunks from that document
-        exact = [c for c in chunks if doc_name.lower() in c["doc_title"].lower()]
+        exact  = [c for c in chunks if doc_name.lower() in c["doc_title"].lower()]
         if exact:
             return doc_name, exact[:top_k]
         # Fallback: best-scoring chunks that are not from OTHER named docs
         other_docs = [d.lower() for d in doc_names if d != doc_name]
-        excluded = [c for c in chunks
-                    if not any(od in c["doc_title"].lower() for od in other_docs)]
+        excluded   = [c for c in chunks
+                      if not any(od in c["doc_title"].lower() for od in other_docs)]
         return doc_name, sorted(excluded or chunks,
                                 key=lambda x: x["score"], reverse=True)[:top_k]
 
@@ -867,21 +942,19 @@ async def tool_multi_compare(
         doc_name, chunks = r
         doc_chunks_map[doc_name] = chunks
 
-    # ── 2. Build per-doc content blocks ─────────────────────────────────────
+    # ── 2. Build per-doc content blocks ──────────────────────────────────────
     contents_block = []
-    all_chunks = []
+    all_chunks     = []
     for doc_name in doc_names:
-        chunks = doc_chunks_map.get(doc_name, [])
+        chunks  = doc_chunks_map.get(doc_name, [])
         all_chunks.extend(chunks)
         content = _build_context(chunks) if chunks else "No relevant content found for this document."
-        contents_block.append(
-            f"--- {doc_name} ---\n{content}"
-        )
+        contents_block.append(f"--- {doc_name} ---\n{content}")
 
-    # ── 3. Build prompt slots ────────────────────────────────────────────────
-    doc_headers = " | ".join(doc_names)
-    separator   = "|".join(["---"] * (len(doc_names) + 1))
-    doc_cells   = " | ".join([f"[{d} value]" for d in doc_names])
+    # ── 3. Build prompt slots ─────────────────────────────────────────────────
+    doc_headers  = " | ".join(doc_names)
+    separator    = "|".join(["---"] * (len(doc_names) + 1))
+    doc_cells    = " | ".join([f"[{d} value]" for d in doc_names])
     doc_sections = "\n\n".join(
         f"DOCUMENT — {d}\n[3-5 bullets: exact facts, clause wording, numbers from {d} only]"
         for d in doc_names
@@ -897,7 +970,7 @@ async def tool_multi_compare(
     )
 
     response = await _get_llm().ainvoke(prompt)
-    raw = response.content.strip()
+    raw      = response.content.strip()
 
     summary = ""
     if "SUMMARY:" in raw:
@@ -905,13 +978,13 @@ async def tool_multi_compare(
 
     # node_save_history() in agent_graph handles history persistence
     return {
-        "answer":      raw,
-        "summary":     summary,
-        "doc_names":   doc_names,
-        "citations":   _citations(all_chunks),
-        "chunks":      all_chunks,
-        "tool_used":   "multi_compare",
-        "confidence":  _confidence(all_chunks),
+        "answer":     raw,
+        "summary":    summary,
+        "doc_names":  doc_names,
+        "citations":  _citations(all_chunks),
+        "chunks":     all_chunks,
+        "tool_used":  "multi_compare",
+        "confidence": _confidence(all_chunks),
     }
 
 
@@ -935,14 +1008,14 @@ async def tool_analysis(question: str, filters: dict,
 
     if is_legal:
         contract_boost = "contract agreement clause legal terms obligations termination"
-        primary_query = f"{question} {contract_boost}"
+        primary_query  = f"{question} {contract_boost}"
     else:
         primary_query = question
 
     # PERF: run primary retrieval and history fetch in parallel
     chunks, history = await asyncio.gather(
         _retrieve(primary_query, filters, top_k=15),
-        _get_history(session_id),  # PERF: fetched in parallel instead of after
+        _get_history(session_id),
     )
 
     if is_legal and len(chunks) < 10:
@@ -998,7 +1071,7 @@ async def tool_analysis(question: str, filters: dict,
             "confidence": "low",
         }
 
-    chunks = sorted(chunks, key=lambda x: x["score"], reverse=True)
+    chunks  = sorted(chunks, key=lambda x: x["score"], reverse=True)
     context = _build_context(chunks[:20])
 
     response = await _get_llm().ainvoke(
@@ -1013,4 +1086,4 @@ async def tool_analysis(question: str, filters: dict,
         "chunks":     chunks,
         "tool_used":  "analysis",
         "confidence": "high",
-    } 
+    }
