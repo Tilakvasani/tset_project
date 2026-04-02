@@ -189,8 +189,13 @@ async def api_ask(req: AskRequest):
         from backend.rag.rag_service import _answer_key
         
         # ── Early Fast-Path Cache Check ───────────────────────────────────────
+        # Only allow fast-path for simple, single-sentence questions.
+        # Bypass if it looks like a multi-query (conjunctions) or an action (ticket, create).
+        _q_norm = question.lower()
+        _complex = any(k in _q_norm for k in [" and ", " also ", " plus ", "create ", "ticket", "status", "mark", "resolved"])
+        
         a_key = _answer_key(question, {})
-        if not getattr(req, "skip_cache", False):
+        if not getattr(req, "skip_cache", False) and not _complex:
             hit = await cache.get(a_key)
             if hit:
                 logger.info("⚡ [%s] Fast-path Cache HIT for query", request_id)
@@ -201,6 +206,8 @@ async def api_ask(req: AskRequest):
                 hit["tool_used"]   = hit.get("tool_used", "search")
                 hit["agent_reply"] = ""
                 return hit
+        elif _complex:
+            logger.info("⏩ [%s] Fast-path bypass: complex query detected", request_id)
                 
         # Pass the full question to the agent graph, which will split it if needed.
         result = await run_agent(

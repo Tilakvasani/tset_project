@@ -1,0 +1,10 @@
+[
+  {
+    "question": "What is the notice period mentioned in the employment contract?",
+    "ground_truth": "The employment contract specifies a notice period of [X days/weeks] for resignation or termination by either party."
+  },
+  {
+    "question": "What are the confidentiality obligations in the NDA?",
+    "ground_truth": "The NDA requires both parties to keep all shared business information strictly confidential and not disclose it to any third party without prior written consent."
+  }
+]

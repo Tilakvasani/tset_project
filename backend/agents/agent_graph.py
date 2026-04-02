@@ -62,14 +62,8 @@ KNOWN_DOCS = [
     "NDA", "MSA", "SOW", "Service Agreement", "Renewal Agreement",
     "Employee Handbook", "Offer Letter", "Sales Agreement",
 ]
+# ── Multi-query split logic has been moved to the LLM (multi_query tool) ──
 
-# ── Multi-query split patterns ────────────────────────────────────────────────
-_MQ_SPLITTERS = [
-    " and also ", " and what ", " and how ", " and who ", " and where ", " and when ",
-    " also what ", " also how ", " also when ", " also where ", " also who ", " also which ",
-    " additionally ", " furthermore ", " moreover ", " plus ",
-    " as well as ", " along with ",
-]
 
 # ── Tool definitions (for LLM bind_tools) ────────────────────────────────────
 TOOLS = [
@@ -78,15 +72,15 @@ TOOLS = [
         "function": {
             "name": "search",
             "description": (
-                "Search turabit's internal documents to answer a question. "
-                "Use for: specific facts, yes/no questions, list questions, "
-                "explain questions, how-does-it-work questions, who/what/when/where questions, "
-                "or any general document lookup. This is the default tool for document questions."
+                "Search turabit's internal documents to answer a SINGLE question. "
+                "CRITICAL: If the user says 'Who is X and create a ticket', you MUST NOT "
+                "use this tool. You MUST use 'multi_query' to split the tasks. "
+                "NEVER ignore actions like ticket creation or updates in favor of a search."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "question": {"type": "string", "description": "The exact user question, cleaned up for retrieval"}
+                    "question": {"type": "string", "description": "ONE clean question ONLY"}
                 },
                 "required": ["question"],
             },
@@ -220,8 +214,9 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "ticket_id": {"type": "string", "description": "Optional manual ticket ID"}
-                },
+                    "ticket_index": {"type": "string", "description": "Index number if selecting from a list (e.g. '1')"},
+                    "question": {"type": "string", "description": "The specific question or subject to create a ticket for (use this for multi-part queries)"}
+                }
             },
         },
     },
@@ -283,9 +278,10 @@ TOOLS = [
         "function": {
             "name": "multi_query",
             "description": (
-                "Split a complex message into 2-5 independent sub-questions. "
-                "Use when the user asks multiple distinct things: "
-                "'What are the working hours? Also, how do I create a ticket?'"
+                "Split a complex or mixed-intent message into 2-5 independent sub-tasks. "
+                "MANDATORY: Use this if the message has 2+ actions/questions. "
+                "Example: 'Who is Rahul and create a ticket' -> ['Who is Rahul?', 'Create a ticket']. "
+                "Example: 'Compare NDA vs MSA and also summarize the leave policy'."
             ),
             "parameters": {
                 "type": "object",
@@ -320,14 +316,20 @@ SYSTEM_PROMPT = f"""You are CiteRAG — Turabit's intelligent internal document 
 You answer questions STRICTLY from Turabit's internal business documents.
 
 You have access to 12 tools. Pick EXACTLY ONE per turn. ALWAYS call a tool.
-NEVER put text in your response content — all output comes from the tool result.
 
-TOOL SELECTION RULES
-━━━━━━━━━━━━━━━━━━━━
-  search        → specific facts, yes/no, lists, how/why/who/what/where
-  compare       → exactly 2 named documents: "compare NDA vs SOW"
+INTENT CHECKLIST (MANDATORY)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Step 1: Check if the message contains ANY action words (create, ticket, status, resolved, close).
+Step 2: Check if there is ALSO a question (who is, what is, compare, analyze).
+Step 3: If BOTH Action AND Question are present -> You MUST use 'multi_query' with sub_tasks.
+Step 4: If only ONE clear intent is present, call the specific tool.
+
+TOOL SELECTION
+━━━━━━━━━━━━━━
+  search        → ONE specific fact ONLY. Do NOT use for 'Who is X and create ticket'.
+  multi_query   → 2+ distinct sub_tasks (MANDATORY for Search+Action)
+  compare       → exactly 2 documents only
   multi_compare → 3+ named documents at once
-  multi_query   → 2+ distinct questions: "What is X? Also, how is Y?"
   analyze       → audit / gap / contradiction / risk questions
   summarize     → "summarize", "overview of", "key points", "TL;DR"
   full_doc      → "full contract", "entire NDA", "complete handbook"
@@ -622,8 +624,14 @@ async def _track_if_unanswered(question: str, result: dict, session_id: str):
 
 # ── Ticket executors ──────────────────────────────────────────────────────────
 
-async def _exec_create_ticket(session_id: str, ticket_id: str = None) -> str:
+async def _exec_create_ticket(session_id: str, ticket_id: str = None, question: str = None) -> str:
     memory     = await _load_memory(session_id)
+    
+    # Priority 1: Explicit question provided by LLM (important for multi-query)
+    if question:
+        reply, _ = await _make_ticket(question, session_id, memory)
+        return reply
+
     unanswered = memory.get("unanswered_questions", [])
     if not unanswered:
         return (
@@ -812,76 +820,8 @@ async def node_load_context(state: AgentState) -> AgentState:
     return {**state, "history": history, "memory": memory}
 
 
-async def node_multi_query_split(state: AgentState) -> AgentState:
-    """Node 2: Detect multi-query messages and populate sub_questions."""
-    sub_questions = _split_multi_query(state["question"])
-    is_multi = len(sub_questions) > 1
-    if is_multi:
-        logger.info(
-            "🔀 [Multi-query] %d sub-questions: %s",
-            len(sub_questions), [q[:50] for q in sub_questions],
-        )
-    return {**state, "is_multi": is_multi, "sub_questions": sub_questions}
+# ── node_multi_query_split and node_fan_out removed in favor of LLM-driven splitting ──
 
-
-def edge_after_split(state: AgentState) -> str:
-    """Conditional edge: route to fan_out or route based on is_multi."""
-    return "fan_out" if state.get("is_multi") else "route"
-
-
-async def node_fan_out(state: AgentState) -> AgentState:
-    """
-    Node 3a: Run each sub-question through route+execute in parallel.
-    First sub-question inherits doc_a/doc_b hints; the rest are plain searches.
-    """
-    sub_questions = state["sub_questions"]
-    session_id    = state["session_id"]
-    doc_a         = state.get("doc_a", "")
-    doc_b         = state.get("doc_b", "")
-    doc_list      = state.get("doc_list")
-
-    async def _run_one(q: str, inherit_hints: bool) -> dict:
-        sub: AgentState = {
-            "question":    q,
-            "session_id":  session_id,
-            "doc_a":       doc_a if inherit_hints else "",
-            "doc_b":       doc_b if inherit_hints else "",
-            "doc_list":    doc_list if inherit_hints else None,
-            "history":     state.get("history", []),
-            "memory":      state.get("memory", {}),
-            "tool_name":   "",
-            "tool_args":   {},
-            "result":      {},
-            "reply":       "",
-            "is_multi":    False,
-            "sub_questions": [],
-            "sub_results": [],
-        }
-        sub = await node_route(sub)
-        sub = await node_execute_tool(sub)
-        return sub.get("result", {})
-
-    coros = [
-        _run_one(sub_questions[0], inherit_hints=True),
-        *[_run_one(q, inherit_hints=False) for q in sub_questions[1:]],
-    ]
-    raw = await asyncio.gather(*coros, return_exceptions=True)
-
-    sub_results = []
-    clean_questions = []
-    for q, r in zip(sub_questions, raw):
-        if isinstance(r, Exception):
-            logger.error("Sub-query failed for %r: %s", q[:50], r)
-            sub_results.append({
-                "answer": "⚠️ Could not retrieve an answer for this sub-question.",
-                "citations": [], "chunks": [], "confidence": "low", "tool_used": "search",
-            })
-        else:
-            sub_results.append(r)
-        clean_questions.append(q)
-
-    merged = _merge_multi_results(clean_questions, sub_results)
-    return {**state, "result": merged, "reply": merged["answer"], "sub_results": sub_results}
 
 
 async def node_route(state: AgentState) -> AgentState:
@@ -911,8 +851,14 @@ async def node_route(state: AgentState) -> AgentState:
     tool_args = {"question": question}
 
     try:
+        # ── Tool Binding ─────────────────────────────────────────────────────────
+        # If we are already in a sub-query (is_multi=True), remove multi_query to prevent loop
+        current_tools = TOOLS
+        if state.get("is_multi"):
+            current_tools = [t for t in TOOLS if t.get("function", {}).get("name") != "multi_query"]
+            
         llm            = _get_llm()
-        llm_with_tools = llm.bind_tools(TOOLS)
+        llm_with_tools = llm.bind_tools(current_tools)
         loop           = asyncio.get_running_loop()
         response       = await loop.run_in_executor(None, lambda: llm_with_tools.invoke(messages))
         tool_calls     = getattr(response, "tool_calls", []) or []
@@ -1001,7 +947,11 @@ async def node_execute_tool(state: AgentState) -> AgentState:
             reply  = result.get("answer", "")
 
         elif tool_name == "create_ticket":
-            reply  = await _exec_create_ticket(session_id, tool_args.get("ticket_id"))
+            reply  = await _exec_create_ticket(
+                session_id, 
+                tool_args.get("ticket_id") or tool_args.get("ticket_index"),
+                tool_args.get("question")
+            )
             result = {"tool_used": "create_ticket", "confidence": "high", "citations": [], "chunks": []}
 
         elif tool_name == "select_ticket":
@@ -1021,7 +971,8 @@ async def node_execute_tool(state: AgentState) -> AgentState:
             result = {"tool_used": "update_ticket", "confidence": "high", "citations": [], "chunks": []}
 
         elif tool_name == "multi_query":
-            sub_qs  = tool_args.get("sub_questions", [])
+            # Allow both names for robustness
+            sub_tasks = tool_args.get("sub_tasks") or tool_args.get("sub_questions") or []
             doc_a   = state.get("doc_a", "")
             doc_b   = state.get("doc_b", "")
             doc_list= state.get("doc_list")
@@ -1034,21 +985,29 @@ async def node_execute_tool(state: AgentState) -> AgentState:
                     "doc_list": doc_list if inherit else None,
                     "history": state.get("history", []), "memory": state.get("memory", {}),
                     "tool_name": "", "tool_args": {}, "result": {}, "reply": "",
-                    "is_multi": False, "sub_questions": [], "sub_results": [],
+                    "is_multi": True, # Signal to node_route to disable multi_query
+                    "sub_questions": [], "sub_results": [],
                 }
                 sub = await node_route(sub)
                 sub = await node_execute_tool(sub)
                 return sub.get("result", {})
 
-            # Run in parallel
-            coros = [_run_one_sub(sub_qs[0], True)] + [_run_one_sub(q, False) for q in sub_qs[1:]]
-            raw_res = await asyncio.gather(*coros, return_exceptions=True)
+            # Run sequentially to prevent memory/Redis race conditions between tasks
+            if not sub_tasks:
+                sub_tasks = [question] # safety fallback
             
-            sub_results = [
-                (r if not isinstance(r, Exception) else {"answer": "Error", "chunks": [], "citations": []})
-                for r in raw_res
-            ]
-            result = _merge_multi_results(sub_qs, sub_results)
+            sub_results = []
+            for i, q in enumerate(sub_tasks):
+                # Inherit docs only for the first sub-task (usually the primary question)
+                # Subsequent tasks (like 'create ticket') should fetch fresh context or use memory
+                try:
+                    res = await _run_one_sub(q, inherit=(i == 0))
+                    sub_results.append(res)
+                except Exception as e:
+                    logger.error("Sub-task %d failed: %s", i, e)
+                    sub_results.append({"answer": f"Error: {e}", "chunks": [], "citations": []})
+            
+            result = _merge_multi_results(sub_tasks, sub_results)
             reply  = result["answer"]
 
         elif tool_name == "cancel":
@@ -1083,6 +1042,10 @@ async def node_execute_tool(state: AgentState) -> AgentState:
             result = {"tool_used": tool_name, "confidence": "low", "citations": [], "chunks": []}
 
     result.setdefault("tool_used", tool_name)
+    # Ensure result['answer'] exists for multi_query merging
+    if reply and not result.get("answer"):
+        result["answer"] = reply
+        
     return {**state, "result": result, "reply": reply}
 
 
@@ -1121,31 +1084,16 @@ def _build_graph():
 
     # ── Register nodes ───────────────────────────────────────────────────────
     builder.add_node("load_context",      node_load_context)
-    builder.add_node("multi_query_split", node_multi_query_split)
-    builder.add_node("fan_out",           node_fan_out)
     builder.add_node("route",             node_route)
     builder.add_node("execute_tool",      node_execute_tool)
     builder.add_node("save_history",      node_save_history)
 
     # ── Edges ────────────────────────────────────────────────────────────────
     builder.add_edge(START,               "load_context")
-    builder.add_edge("load_context",      "multi_query_split")
-
-    # After split: multi → fan_out, single → route
-    builder.add_conditional_edges(
-        "multi_query_split",
-        edge_after_split,
-        {"fan_out": "fan_out", "route": "route"},
-    )
-
-    # Single-query path
-    builder.add_edge("route",        "execute_tool")
-    builder.add_edge("execute_tool", "save_history")
-
-    # Multi-query path (fan_out calls route+execute internally)
-    builder.add_edge("fan_out", "save_history")
-
-    builder.add_edge("save_history", END)
+    builder.add_edge("load_context",      "route")
+    builder.add_edge("route",             "execute_tool")
+    builder.add_edge("execute_tool",      "save_history")
+    builder.add_edge("save_history",      END)
 
     return builder.compile()
 
