@@ -58,7 +58,6 @@ MAX_HISTORY_TOKENS = 12_000
 MIN_HISTORY_TURNS  = 2
 
 
-# ── Multi-query split logic has been moved to the LLM (multi_query tool) ──
 
 
 # ── Tool definitions (for LLM bind_tools) ────────────────────────────────────
