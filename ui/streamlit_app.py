@@ -1929,30 +1929,6 @@ elif st.session_state.active_tab == "agent":
                 st.error(f"Sync failed: {st.session_state.get('_last_api_error', 'Unknown error')}")
             st.rerun()
 
-        st.divider()
-
-        # Sync memory from backend (LangGraph checkpointer)
-        if st.button("↺ Sync from Backend", key="ag_sync_mem", use_container_width=True):
-            st.session_state._last_api_error = None  # Clear previous errors
-            _mres = api_get(f"/agent/memory?session_id={st.session_state.rag_active_chat}")
-            if _mres and "error" not in _mres:
-                st.session_state.agent_memory.update(_mres.get("memory", {}))
-                st.success("Memory synced!")
-                st.rerun()
-            else:
-                st.warning(
-                    f"⚠️ `/api/agent/memory` not yet implemented. "
-                    "Memory will populate automatically once `agent_routes.py` is deployed."
-                )
-
-        # Quick stats
-        st.divider()
-        _open_n = len([t for t in st.session_state.agent_tickets
-                       if t.get("status") == "Open"])
-        _tot_n  = len(st.session_state.agent_tickets)
-        _c1, _c2 = st.columns(2)
-        _c1.metric("Total Tickets", _tot_n)
-        _c2.metric("Open", _open_n)
 
     # ════════════════════════════════════════════════════════════
     #  RIGHT — 🎫 My Tickets
@@ -2113,29 +2089,3 @@ elif st.session_state.active_tab == "agent":
                                     else:
                                         st.error(_ur.get("error", "Update failed") if _ur
                                                  else "Backend unreachable")
-
-    # ── Backend endpoint reference (collapsible) ───────────────────────────────
-    st.divider()
-    with st.expander("🔧 Backend endpoints needed to fully activate this tab"):
-        st.markdown("""
-| Endpoint | Method | Purpose |
-|---|---|---|
-| `/api/agent/tickets` | GET | Fetch all tickets from Notion ticket DB |
-| `/api/agent/tickets/update` | POST | Update ticket status in Notion |
-| `/api/agent/memory` | GET | Read LangGraph thread memory for current user |
-
-
-**How tickets get created (manual only):**
-The LangGraph agent detects ticket-creation intent from the user's message:
-- ✅ "create a ticket", "raise a ticket", "open a case", "generate a ticket"
-- ✅ "escalate this", "log this", "file a ticket", "submit a request"
-- ✅ "mark as resolved", "set to in progress", "close the ticket"
-
-**Duplicate detection (2-layer):**
-- Layer 1 — Exact: MD5 hash of normalised question → Redis lookup (instant)
-- Layer 2 — Semantic: cosine similarity of embeddings ≥ 0.88 → blocks duplicate
-
-**New file required:** Place `ticket_dedup.py` in `backend/services/rag/`
-
-**New endpoint:** `DELETE /api/agent/dedup/flush` — clears dedup cache after bulk cleanup
-""")

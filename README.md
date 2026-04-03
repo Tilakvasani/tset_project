@@ -436,13 +436,6 @@ Import `postman/docgen_collection.json` into Postman to test all API endpoints w
 ## 📝 License
 
 MIT License — feel free to use, modify, and distribute.
-
----
-
-<<<<<<< HEAD
-Built with ⚡ by [Tilak Vasani](https://github.com/Tilakvasani)
-# CiteRAG Backend — New Files Guide
-=======
 ---
 
 Built with ⚡ by [Tilak Vasani](https://github.com/Tilakvasani)
@@ -589,7 +582,7 @@ GET    /docs      → Swagger UI
 - [ ] Say "all" after list shown → both tickets updated
 - [ ] `GET /api/agent/tickets` → both tickets visible with correct status
 
->>>>>>> rag
+
 
 ## What was built
 

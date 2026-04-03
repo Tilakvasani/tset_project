@@ -5,9 +5,8 @@ agent_routes.py — FastAPI routes for the CiteRAG Agent layer
 Endpoints:
   GET  /api/agent/tickets           — Fetch all knowledge-gap tickets from Notion DB
   POST /api/agent/tickets/update    — Update ticket status in Notion
-  GET  /api/agent/memory            — Read agent memory for current session
+  POST /api/agent/memory            — Save user profile hints to session memory
   POST /api/agent/ticket/create     — (internal) Create a new ticket from low-confidence RAG answers
-  DELETE /api/agent/dedup/flush     — Clear dedup cache (admin)
 """
 
 # ── Standard library ──────────────────────────────────────────────────────────
@@ -265,20 +264,6 @@ async def update_ticket(req: TicketUpdateRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/memory")
-async def get_memory(session_id: str = "default"):
-    """
-    Return the agent memory for the current session.
-    Reads from Redis — same keys used by agent_graph.py.
-    """
-    try:
-        mem_key   = f"docforge:agent:memory:{session_id}"
-        agent_mem = await cache.get(mem_key) or {}
-        return {"session_id": session_id, "memory": agent_mem}
-
-    except Exception as e:
-        logger.error("get_memory error: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/memory")
