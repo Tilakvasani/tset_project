@@ -630,6 +630,24 @@ if st.session_state.active_tab == "ask":
             else:
                 st.markdown(text)
 
+            # ── Copy button on assistant answers ──────────────────────────────
+            if role == "assistant":
+                import streamlit.components.v1 as _components
+                _safe_text = text.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
+                _components.html(
+                    f"""<button onclick="
+                        const el = document.createElement('textarea');
+                        el.value = `{_safe_text}`;
+                        document.body.appendChild(el);
+                        el.select();
+                        document.execCommand('copy');
+                        document.body.removeChild(el);
+                        this.textContent = '\u2705 Copied!';
+                        setTimeout(() => this.textContent = '\U0001f4cb Copy answer', 2000);
+                    " style="background:#131722;border:1px solid #1e2843;border-radius:6px;color:#94a3b8;font-size:12px;padding:4px 12px;cursor:pointer;font-family:inherit;">\U0001f4cb Copy answer</button>""",
+                    height=36,
+                )
+
             if citations and role == "assistant":
                 seen, unique = set(), []
                 for c in citations:
@@ -1980,15 +1998,10 @@ elif st.session_state.active_tab == "agent":
   <div style="font-size:2rem;margin-bottom:0.6rem">🎫</div>
   <div style="color:#475569;font-size:0.85rem;line-height:1.6">
     No tickets yet.<br>
-<<<<<<< HEAD
-    When <b style="color:#93c5fd">CiteRAG</b> can't find an answer in the documents,<br>
-    the LangGraph agent will auto-create a ticket here<br>
-    with the question, attempted sources, and priority.
-=======
+
     Ask a question in <b style="color:#93c5fd">💬 CiteRAG</b>, then say:<br>
     <b style="color:#a5b4fc">"create a ticket"</b> · <b style="color:#a5b4fc">"raise a ticket"</b> · <b style="color:#a5b4fc">"open a case"</b><br>
     Duplicate questions are automatically detected before creating a new ticket.
->>>>>>> rag
   </div>
 </div>
 """, unsafe_allow_html=True)
