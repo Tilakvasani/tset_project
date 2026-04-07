@@ -28,6 +28,13 @@ import os
 
 
 class Settings(BaseSettings):
+    """
+    Application settings and environment configuration.
+    
+    Loads values from a .env file or environment variables. This class
+    centrally manages credentials for Azure OpenAI, Notion, Redis, 
+    and general application behavior.
+    """
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -35,25 +42,25 @@ class Settings(BaseSettings):
     )
 
     # ── Azure OpenAI — LLM ────────────────────────────────────────────────────
-    AZURE_LLM_ENDPOINT:            str = ""
-    AZURE_OPENAI_LLM_KEY:          str = ""
-    AZURE_LLM_DEPLOYMENT_41_MINI:  str = "gpt-4.1-mini"
-    AZURE_LLM_API_VERSION:         str = "2024-12-01-preview"
+    AZURE_LLM_ENDPOINT:            str = ""                  # Azure endpoint URL
+    AZURE_OPENAI_LLM_KEY:          str = ""                  # Azure API key
+    AZURE_LLM_DEPLOYMENT_41_MINI:  str = "gpt-4.1-mini"      # Deployment name
+    AZURE_LLM_API_VERSION:         str = "2024-12-01-preview" # API version
 
     # ── Azure OpenAI — Embeddings ─────────────────────────────────────────────
-    AZURE_EMB_ENDPOINT:            str = ""
-    AZURE_OPENAI_EMB_KEY:          str = ""
-    AZURE_EMB_DEPLOYMENT:          str = "text-embedding-3-large"
+    AZURE_EMB_ENDPOINT:            str = ""                  # Embeddings endpoint URL
+    AZURE_OPENAI_EMB_KEY:          str = ""                  # Embeddings API key
+    AZURE_EMB_DEPLOYMENT:          str = "text-embedding-3-large" 
     AZURE_EMB_API_VERSION:         str = "2024-02-01"
 
     # ── Notion ────────────────────────────────────────────────────────────────
-    NOTION_TOKEN:                  str = ""       # preferred key name
-    NOTION_API_KEY:                str = ""       # legacy key name (alias fallback)
-    NOTION_DATABASE_ID:            str = ""       # Source docs DB
-    NOTION_TICKET_DB_ID:           Optional[str] = None  # Ticket tracking DB
+    NOTION_TOKEN:                  str = ""       # Main integration token
+    NOTION_API_KEY:                str = ""       # Legacy fallback alias
+    NOTION_DATABASE_ID:            str = ""       # ID of the RAG source database
+    NOTION_TICKET_DB_ID:           Optional[str] = None  # ID of the ticket tracking database
 
     # ── Vector store ──────────────────────────────────────────────────────────
-    CHROMA_PATH:                   str = ""
+    CHROMA_PATH:                   str = ""       # Absolute path to ChromaDB storage
 
     # ── Cache ─────────────────────────────────────────────────────────────────
     REDIS_URL:                     str = "redis://localhost:6379/0"
@@ -66,7 +73,13 @@ class Settings(BaseSettings):
     LOG_LEVEL:                     str = "INFO"
 
     def model_post_init(self, __context):
-        """Pydantic v2 lifecycle hook — runs after model initialization."""
+        """
+        Pydantic v2 lifecycle hook.
+        
+        Finalizes configuration after the model is initialized:
+        - Resolves CHROMA_PATH to an absolute path.
+        - Ensures the storage directory exists.
+        """
         # Resolve CHROMA_PATH to absolute path
         if not self.CHROMA_PATH:
             self.CHROMA_PATH = str(Path(__file__).parent.parent.parent / "chroma_db")

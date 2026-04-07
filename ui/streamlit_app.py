@@ -6,6 +6,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import streamlit as st
 import httpx
+from typing import Optional, List, Dict, Any, Union
 
 try:
     from docx_builder import build_docx
@@ -282,7 +283,16 @@ hr { border-color: #1e2433 !important; margin: 0.5rem 0 !important; }
 
 # ── API helpers ────────────────────────────────────────────────────────────────
 
-def api_get(ep):
+def api_get(ep: str) -> Optional[dict]:
+    """
+    Sends a GET request to the backend API.
+    
+    Args:
+        ep: The API endpoint (suffix after /api).
+        
+    Returns:
+        The JSON response as a dictionary, or None if the request fails.
+    """
     try:
         r = httpx.get(f"{API_URL}{ep}", timeout=30)
         r.raise_for_status()
@@ -294,7 +304,18 @@ def api_get(ep):
     return None
 
 
-def api_post(ep, data, timeout=120):
+def api_post(ep: str, data: dict, timeout: int = 120) -> Optional[dict]:
+    """
+    Sends a POST request to the backend API.
+    
+    Args:
+        ep: The API endpoint (suffix after /api).
+        data: The JSON payload to send.
+        timeout: Maximum time to wait for a response.
+        
+    Returns:
+        The JSON response as a dictionary, or None if an error occurs.
+    """
     try:
         r = httpx.post(f"{API_URL}{ep}", json=data, timeout=timeout)
         r.raise_for_status()
@@ -314,6 +335,12 @@ def api_post(ep, data, timeout=120):
 # ── Session ────────────────────────────────────────────────────────────────────
 
 def init_session():
+    """
+    Initializes the Streamlit session state with default values.
+    
+    Ensures all required keys for DocForge generation, CiteRAG chat history,
+    and Agent memory are present before the UI renders.
+    """
     defaults = dict(
         step=1, company_ctx={}, departments=[],
         selected_dept=None, selected_dept_id=None,
@@ -333,7 +360,7 @@ def init_session():
         agent_tickets_loaded=False,
         _pending_ticket_idx=None,  # index of message awaiting ticket creation
         _ticket_created={},        # {msg_idx: ticket_url} — tracks created tickets per message
-        agent_memory={},           # {user_name, industry, last_doc, last_intent}
+        agent_memory={},           # {last_doc, last_intent}
     )
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -486,7 +513,6 @@ with st.sidebar:
         ctx = st.session_state.company_ctx
         if ctx.get("company_name"):
             st.markdown(f"🏢 **{ctx['company_name']}**")
-            st.caption(f"{ctx.get('industry','')} · {ctx.get('region','')}")
         if st.session_state.selected_doc_type:
             st.caption(f"📄 {st.session_state.selected_doc_type}")
         if st.session_state.sections:
@@ -525,6 +551,10 @@ if st.session_state.active_tab == "ask":
     active_chat = st.session_state.rag_chats[active_id]
     messages    = active_chat["messages"]
 
+    # ── Sidebar Cleanup (Moved to Tickets only) ──
+    with st.sidebar:
+        st.divider()
+
     if not messages:
         st.markdown("""
 <div style="text-align:center;padding:3rem 0 1rem">
@@ -556,12 +586,19 @@ if st.session_state.active_tab == "ask":
         confidence = msg.get("confidence", "")
 
         with st.chat_message(role):
+            # Identity chips removed from chat as per 'Notion-only' request
+            pass            
             if role == "assistant" and confidence:
                 badge_cls = "cite-high" if confidence == "high" else "cite-medium" if confidence == "medium" else "cite-low"
                 badge_label = "CiteRAG"
                 st.markdown(f'<span class="cite-badge {badge_cls}">{badge_label}</span>', unsafe_allow_html=True)
 
-            if msg.get("tool_used") == "compare" and msg.get("side_a"):
+            # Render comparison UI if specifically flagged or if comparison tags are present in text
+            import re
+            doc_heads   = re.findall(r"(DOCUMENT\s*[\:\-\—\–].+)", text)
+            is_comp_fmt = len(doc_heads) >= 2 or "COMPARISON TABLE" in text
+            
+            if (msg.get("tool_used") == "compare" and msg.get("side_a")) or is_comp_fmt:
                 raw = msg.get("content", "")
 
                 def _sect(text, start_tag, end_tags):
@@ -573,20 +610,27 @@ if st.session_state.active_tab == "ask":
                             part = part.split(tag, 1)[0]
                     return part.strip()
 
-                doc_a = msg.get("doc_a", "Document A")
-                doc_b = msg.get("doc_b", "Document B")
-                doc_a_tag = f"DOCUMENT A -- {doc_a}"
-                doc_b_tag = f"DOCUMENT B -- {doc_b}"
+                # ── Dynamic Section Extraction ──
+                footer_tags   = ["COMPARISON TABLE", "GAP IDENTIFIED:", "KEY DIFFERENCE:", "SYSTEMIC ISSUE", "COMPARISON INSIGHT:", "SUMMARY:"]
+                final_answer  = _sect(raw, "FINAL ANSWER", doc_heads[:1] + ["DOCUMENT:", "DOCUMENT_A:"] + footer_tags)
+                
+                # Extract all documents found by regex
+                doc_sections = []
+                for i, head in enumerate(doc_heads):
+                    # End at next header or any footer tag
+                    ends = doc_heads[i+1:] + footer_tags
+                    content = _sect(raw, head, ends)
+                    # Clean title (remove "DOCUMENT" and punctuation)
+                    title = re.sub(r"DOCUMENT\s*[\:\-\—\–]\s*", "", head, flags=re.I).strip()
+                    doc_sections.append((title, content))
 
-                final_answer  = _sect(raw, "FINAL ANSWER", [doc_a_tag, "DOCUMENT_A:"])
-                if doc_a_tag in raw:
-                    doc_a_content = _sect(raw, doc_a_tag, [doc_b_tag, "COMPARISON TABLE", "GAP IDENTIFIED:"])
-                    doc_b_content = _sect(raw, doc_b_tag, ["COMPARISON TABLE", "GAP IDENTIFIED:", "KEY DIFFERENCE:", "COMPARISON INSIGHT:", "SUMMARY:"])
-                    comp_table    = _sect(raw, "COMPARISON TABLE", ["GAP IDENTIFIED:", "KEY DIFFERENCE:", "SYSTEMIC ISSUE", "COMPARISON INSIGHT:"])
-                else:
-                    doc_a_content = msg.get("side_a", "")
-                    doc_b_content = msg.get("side_b", "")
-                    comp_table    = msg.get("comp_table", "")
+                # Fallback for old explicit keys if no documents found in text
+                if not doc_sections and msg.get("side_a"):
+                    doc_sections.append((msg.get("doc_a", "Document A"), msg.get("side_a", "")))
+                    doc_sections.append((msg.get("doc_b", "Document B"), msg.get("side_b", "")))
+
+                comp_table = _sect(raw, "COMPARISON TABLE", ["GAP IDENTIFIED:", "KEY DIFFERENCE:", "SYSTEMIC ISSUE", "COMPARISON INSIGHT:"])
+                if not comp_table: comp_table = msg.get("comp_table", "")
 
                 gap_block  = _sect(raw, "GAP IDENTIFIED:", ["KEY DIFFERENCE:", "SYSTEMIC ISSUE", "COMPARISON INSIGHT:", "SUMMARY:"])
                 key_diff   = _sect(raw, "KEY DIFFERENCE:", ["SYSTEMIC ISSUE", "COMPARISON INSIGHT:", "SUMMARY:"])
@@ -598,13 +642,16 @@ if st.session_state.active_tab == "ask":
                     st.markdown("📋 **FINAL ANSWER:** " + final_answer)
                     st.divider()
 
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.markdown(f"**🔵 {doc_a}**")
-                    st.markdown(doc_a_content or msg.get("side_a", ""))
-                with col_b:
-                    st.markdown(f"**🟢 {doc_b}**")
-                    st.markdown(doc_b_content or msg.get("side_b", ""))
+                # ── Render documents in Grid (2 columns per row) ──
+                for i in range(0, len(doc_sections), 2):
+                    row_cols = st.columns(2)
+                    for j in range(2):
+                        if i + j < len(doc_sections):
+                            title, content = doc_sections[i + j]
+                            color = "🔵" if (i + j) % 2 == 0 else "🟢"
+                            with row_cols[j]:
+                                st.markdown(f"**{color} {title}**")
+                                st.markdown(content)
 
                 if comp_table:
                     st.divider()
@@ -784,9 +831,18 @@ if st.session_state.active_tab == "ask":
                         full_answer = res.get("answer", "")
                         stream_placeholder.write(full_answer)
                         
+            except requests.exceptions.HTTPError as e:
+                try:
+                    err = e.response.json().get("detail", "Request rejected by security policy.")
+                except:
+                    err = f"API Error: {e.response.status_code}"
+                st.session_state._last_api_error = f"**Security Alert:** {err}"
+                stream_placeholder.write(st.session_state._last_api_error)
+                res = None
             except Exception as e:
                 err = f"Could not reach the RAG service. Make sure the backend is running. {e}"
-                stream_placeholder.write(f"⚠️ **Error:** {err}")
+                st.session_state._last_api_error = f"**Error:** {err}"
+                stream_placeholder.write(st.session_state._last_api_error)
                 res = None
 
         if res:
@@ -838,6 +894,13 @@ if st.session_state.active_tab == "ask":
 
     if chunks:
         if st.toggle(toggle_label, value=False, key="show_retrieval"):
+
+            # ── 🔬 Premium RAGAS Integration (New: From v11.0) ──
+            last_scores = st.session_state.get("_last_ragas_scores")
+            if last_scores and not not_found:
+                st.markdown("#### 🔬 Answer Quality (RAGAS)")
+                _render_ragas_scores(last_scores, title="Automatic evaluation for this answer")
+                st.divider()
 
             # ── Banner when answer was not found ─────────────────────────────
             if not_found:
@@ -1825,10 +1888,9 @@ elif st.session_state.active_tab == "generate":
             c1.metric("Document", doc_type)
             c2.metric("Department", st.session_state.selected_dept)
             c3.metric("Company", ctx.get("company_name", "--"))
-            c4, c5, c6 = st.columns(3)
-            c4.metric("Industry", ctx.get("industry", "--"))
-            c5.metric("Sections", len(active))
-            c6.metric("Words", f"~{len(full_doc.split())}")
+            c4, c5 = st.columns(2)
+            c4.metric("Sections", len(active))
+            c5.metric("Words", f"~{len(full_doc.split())}")
 
         st.divider()
         col_n, col_d = st.columns(2)
@@ -1873,8 +1935,6 @@ elif st.session_state.active_tab == "generate":
                                 doc_type=doc_type,
                                 department=st.session_state.selected_dept,
                                 company_name=ctx.get("company_name", "Company"),
-                                industry=ctx.get("industry", ""),
-                                region=ctx.get("region", ""),
                                 sections=sections_data,
                             )
                             st.session_state.docx_cache_doc = doc_type

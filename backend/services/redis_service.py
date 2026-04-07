@@ -103,7 +103,16 @@ class RedisCache:
     # ── Core ops ───────────────────────────────────────────────────────────────
 
     async def get(self, key: str) -> Optional[Any]:
-        """Return deserialized value or None on miss / error."""
+        """
+        Retrieves and deserializes a value from Redis.
+        
+        Args:
+            key: The unique cache key.
+            
+        Returns:
+            The parsed JSON value (dict, list, etc.) or None if 
+            the key is missing or Redis is unavailable.
+        """
         if not self._available:
             if not await self._try_reconnect():
                 return None
@@ -120,7 +129,17 @@ class RedisCache:
             return None
 
     async def set(self, key: str, value: Any, ttl: int = 3600) -> bool:
-        """Serialize and store value with TTL. Returns False on error."""
+        """
+        Serializes and stores a value in Redis with a TTL.
+        
+        Args:
+            key: The unique cache key.
+            value: Any JSON-serializable object.
+            ttl: Time-to-live in seconds (default 1 hour).
+            
+        Returns:
+            True if the store succeeded, False if Redis is unavailable.
+        """
         if not self._available:
             if not await self._try_reconnect():
                 return False

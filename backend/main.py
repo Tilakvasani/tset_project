@@ -30,27 +30,41 @@ from backend.api.agent_routes import router as agent_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    FastAPI lifespan context manager — runs startup logic before yield,
-    shutdown logic after yield. Replaces deprecated @app.on_event.
+    FastAPI lifespan context manager.
+    
+    Handles startup and shutdown logic for the application:
+    - Startup: Initializes logging, connects to Redis.
+    - Shutdown: Gracefully disconnects from Redis.
+    
+    Args:
+        app: The FastAPI application instance.
     """
     # ── Startup ───────────────────────────────────────────────────────────────
     _setup_logging()
     
-    connected = await cache.connect(settings.REDIS_URL)
-    if connected:
-        logger.info("✅ Redis ready — deduplication and caching active")
-    else:
-        logger.warning(
-            "⚠️  Redis unavailable — ticket deduplication DISABLED. "
-            "Start Redis to prevent duplicate ticket creation."
-        )
+    try:
+        connected = await cache.connect(settings.REDIS_URL)
+        if connected:
+            logger.info("✅ Redis ready — deduplication and caching active")
+        else:
+            logger.warning(
+                "⚠️  Redis connection failed — ticket deduplication DISABLED. "
+                "Verify REDIS_URL in .env."
+            )
+    except Exception as e:
+        logger.error(f"❌ Redis connection error: {e}")
+        logger.warning("Agent operations will proceed without caching/deduplication.")
+        
     logger.info("DocForge AI backend started — routes: /api/rag/*, /api/agent/*, /api/*")
 
-    yield  # ← app is running here
+    yield  # ← Application is running here
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
-    await cache.disconnect()
-    logger.info("DocForge AI backend shutting down")
+    try:
+        await cache.disconnect()
+        logger.info("DocForge AI backend shutting down")
+    except Exception as e:
+        logger.error(f"❌ Error during shutdown: {e}")
 
 
 app = FastAPI(

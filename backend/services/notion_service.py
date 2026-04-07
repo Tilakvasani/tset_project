@@ -424,8 +424,14 @@ async def _post_blocks_in_batches(page_id: str, blocks: list):
 
 async def _get_next_version(dept: str, doc_type: str) -> int:
     """
-    Query Notion for existing pages with the same Department + Doc Type.
-    Returns max existing version + 1, or 1 if none found.
+    Queries the Notion database for existing versions of a document.
+    
+    Args:
+        dept: The department name (e.g., "HR", "IT").
+        doc_type: The type of document (e.g., "Standard Operating Procedure").
+        
+    Returns:
+        The next version number (max existing + 1), defaulting to 1.
     """
     query = {
         "filter": {
@@ -473,6 +479,24 @@ async def _get_next_version(dept: str, doc_type: str) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def publish_to_notion(request: NotionPublishRequest) -> dict:
+    """
+    Publishes a generated document to a Notion database.
+    
+    This includes:
+      1. Auto-calculating the document version.
+      2. Converting plain text/Markdown to Notion blocks.
+      3. Rendering Mermaid diagrams as images via Imgur.
+      4. Batch-appending blocks to the new page.
+      
+    Args:
+        request: A NotionPublishRequest containing the text and metadata.
+        
+    Returns:
+        A dictionary with "notion_url", "notion_page_id", and "version".
+        
+    Raises:
+        Exception: If the Notion page creation fails.
+    """
     ctx        = request.company_context or {}
     company    = ctx.get("company_name", "Company")
     industry   = ctx.get("industry", "")
@@ -486,7 +510,7 @@ async def publish_to_notion(request: NotionPublishRequest) -> dict:
     # ── Version control: auto-increment if same dept + doc_type exists ──────
     version = await _get_next_version(dept, request.doc_type)
 
-    logger.info(f"Publishing: '{title}' | dept={dept} | words={word_count} | flowcharts={fc_count} | version=v{version}")
+    logger.info(f"📤 Publishing: '{title}' | dept={dept} | words={word_count} | version=v{version}")
 
     meta_lines = [
         f"Organization: {company}",

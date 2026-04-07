@@ -580,14 +580,28 @@ async def ingest_from_notion(force: bool = False) -> dict:
                 "elapsed_s":    round(time.time() - t_start, 1),
             }
 
-        total_docs   = len(pages)
-        total_chunks = 0
-        all_chunks:  list[dict] = []
+        total_docs    = len(pages)
+        total_chunks  = 0
+        skipped_docs  = 0
+        all_chunks:   list[dict] = []
+        
+        # KEY for tracking last sync time: docforge:notion:sync:{page_id}
+        SYNC_KEY = "docforge:notion:sync:{pid}"
 
         # ── Step 2: Extract + chunk ────────────────────────────────────────────
         logger.info("Extracting + chunking %d pages...", total_docs)
         for page in pages:
-            page_id = page["id"]
+            page_id   = page["id"]
+            last_edit = page.get("last_edited_time")
+            
+            # ── Delta Sync: Skip if NOT changed ─────────────────────────────
+            if not force and last_edit:
+                cached_edit = await cache.get(SYNC_KEY.format(pid=page_id))
+                if cached_edit == last_edit:
+                    logger.info("  ⏩ Skipping '%s' (No changes since %s)", page.get("properties", {}).get("title", {}).get("title", [{}])[0].get("plain_text", "Untitled"), last_edit)
+                    skipped_docs += 1
+                    continue
+            
             try:
                 blocks  = await loop.run_in_executor(None, _fetch_page_blocks, page_id)
                 content = _extract_page_content(page, blocks)
@@ -631,6 +645,9 @@ async def ingest_from_notion(force: bool = False) -> dict:
                 "  ✔ Page '%s': %d sections → %d chunks",
                 title, len(content["sections"]), page_chunk_count,
             )
+            # Update last sync time for this page
+            if last_edit:
+                await cache.set(SYNC_KEY.format(pid=page_id), last_edit, ttl=2592000) # 30 days
 
         logger.info("Prepared %d total chunks from %d pages", len(all_chunks), total_docs)
 
@@ -661,16 +678,18 @@ async def ingest_from_notion(force: bool = False) -> dict:
 
         # ── Step 4: Save ingest metadata to Redis ──────────────────────────────
         meta = {
-            "total_docs":   total_docs,
-            "total_chunks": total_chunks,
-            "elapsed_s":    elapsed,
-            "ingested_at":  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "total_docs":     total_docs,
+            "processed_docs": total_docs - skipped_docs,
+            "skipped_docs":   skipped_docs,
+            "total_chunks":   total_chunks,
+            "elapsed_s":      elapsed,
+            "ingested_at":    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         await cache.set(INGEST_META_KEY, meta)
 
         logger.info(
-            "═══ INGEST COMPLETE: %d docs, %d chunks, %.1fs ═══",
-            total_docs, total_chunks, elapsed,
+            "═══ INGEST COMPLETE: %d docs (%d skipped), %d chunks, %.1fs ═══",
+            total_docs, skipped_docs, total_chunks, elapsed,
         )
         return {"status": "done", **meta}
 

@@ -11,41 +11,6 @@ Tools:
   tool_analysis()      — gap/contradiction/audit analysis
   tool_refine()        — HyDE-based summary generation
   tool_full_doc()      — full document retrieval
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CHANGES IN THIS VERSION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-SHIELD REMOVED — tool_search() no longer overrides the LLM answer.
-
-  OLD (broken):
-    answer = llm.invoke(...)
-    if "could not find" in answer.lower():
-        answer = "I could not find information..."   # ← FORCED OVERRIDE
-  
-  This was causing valid answers to be suppressed whenever the LLM used
-  ANY hedging phrase like "I could not find the exact clause but the policy
-  says 30 days..." — the entire answer got replaced with a blank not-found.
-
-  NEW (fixed):
-    The LLM decides from the retrieved context. If chunks exist, the LLM
-    answers from them. The early-return guard only fires when literally
-    ZERO chunks pass the score threshold — i.e., nothing was retrieved at all.
-
-ALL 6 PROMPTS IMPROVED:
-  ANSWER_PROMPT       — "partial answer" rule; no more forced not-found override
-  HYDE_PROMPT         — Turabit-specific HR/legal terms for better retrieval
-  SUMMARY_PROMPT      — raised word limit; added partial-context rule
-  ANALYSIS_PROMPT     — "use best available evidence; do not refuse if partial"
-  COMPARE_PROMPT      — "do not discard partial evidence"
-  MULTI_COMPARE_PROMPT— same; plus per-doc partial-content handling
-  EXPAND_PROMPT       — 4 variants (was 3); includes informal/Hinglish phrasings
-
-Redis fix (was broken in older version):
-  _answer_key() is now actually used. tool_search() does:
-    1. cache.get(answer_key)  → return cached answer immediately
-    2. on miss: run LLM, then cache.set(answer_key, result, TTL_ANSWER)
-  Retrieval results are still cached via _retrieval_key (unchanged).
 """
 
 import hashlib
@@ -397,16 +362,12 @@ def _get_collection():
     global _collection_instance
     if _collection_instance is None:
         client = chromadb.PersistentClient(path=settings.CHROMA_PATH)
-        _collection_instance = client.get_or_create_collection(
-            name=COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"},
-        )
+        _collection_instance = client.get_or_create_collection(name="rag_chunks")
     return _collection_instance
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  CACHE HELPERS
+#  LANGUAGE + CACHE HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def _retrieval_key(query: str, filters: dict, top_k: int) -> str:
     raw = json.dumps({"q": query, "f": filters, "k": top_k}, sort_keys=True)
@@ -515,7 +476,9 @@ async def _retrieve(query: str, filters: dict, top_k: int = 8) -> list:
     embedder   = _get_embedder()
     collection = _get_collection()
 
-    # Step 0: Section/clause number detection — boost retrieval for numeric references
+
+
+    # Step 0.5: Section/clause number detection — boost retrieval for numeric references
     # Queries like "section 27", "clause 5.2", "article 3" don't embed well,
     # so we also do a direct text search in chunk content for the exact reference.
     _section_pattern = re.compile(
@@ -804,19 +767,21 @@ async def tool_search(question: str, filters: dict,
                       session_id: str, top_k: int = 8,
                       stream_queue: asyncio.Queue = None) -> dict:
     """
-    Vector search + LLM answer.
-
-    ── SHIELD REMOVED ──────────────────────────────────────────────────────────
-    The old code had a hard override that replaced the LLM's answer with
-    "I could not find..." whenever the response contained the phrase
-    "could not find". This caused valid, partial answers to be silently
-    dropped — e.g. when the LLM said "I could not find the exact date
-    but the policy states 30 days..." the whole answer was discarded.
-
-    Now: the LLM decides from the retrieved context. If there are chunks,
-    the LLM answers from them — partial or complete. The early-return guard
-    only fires when literally ZERO chunks pass the score threshold.
-    ────────────────────────────────────────────────────────────────────────────
+    Standard RAG search tool (Retrieve -> Rerank -> Generate).
+    
+    Performs a vector search, reranks the results for relevance, and uses 
+    the LLM to generate a cited response. Includes self-healing logic 
+    (HyDE) if no chunks are found initially.
+    
+    Args:
+        question: The user's query or specific question.
+        filters: Dictionary of filters (e.g., department, doc_type).
+        session_id: Client session ID for history retrieval.
+        top_k: Number of chunks to retrieve initially.
+        stream_queue: Optional queue for streaming LLM tokens.
+        
+    Returns:
+        A dictionary containing the answer, citations, chunks, and confidence.
     """
     # ── Redis answer cache ────────────────────────────────────────────────────
     a_key  = _answer_key(question, filters)
@@ -827,242 +792,6 @@ async def tool_search(question: str, filters: dict,
 
     chunks = await _retrieve(question, filters, top_k)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    #  DEPARTMENT SECOND-PASS
-    #  Fires when first-pass returns < 8 chunks AND the question matches
-    #  department-specific keywords. All departments run in parallel.
-    #  Each department adds up to 4 extra chunks per fallback query.
-    #
-    #  Departments covered:
-    #    HR         — leave, salary, appraisal, handbook, attendance, etc.
-    #    Legal      — contract, clause, NDA, termination, liability, etc.
-    #    Finance    — invoice, budget, tax, payroll, expense, payment, etc.
-    #    Sales      — CRM, pipeline, quota, deal, revenue, commission, etc.
-    #    IT         — system, software, access, security, infrastructure, etc.
-    #    Operations — vendor, SLA, procurement, delivery, process, audit, etc.
-    #    Marketing  — campaign, brand, content, SEO, lead, advertising, etc.
-    #    Customer Support — ticket, SLA, escalation, refund, complaint, etc.
-    #    Product    — roadmap, feature, sprint, release, backlog, etc.
-    #    Procurement — purchase order, supplier, RFQ, sourcing, bid, etc.
-    # ══════════════════════════════════════════════════════════════════════════
-
-    q_lower = question.lower()
-
-    # ── Department keyword maps ───────────────────────────────────────────────
-    _DEPT_SIGNALS = {
-        "HR": [
-            "leave policy", "leave balance", "leave encashment",
-            "leave entitlement", "sick leave", "casual leave",
-            "maternity leave", "paternity leave", "annual leave",
-            "salary structure", "salary slip", "salary revision",
-            "notice period", "resignation process", "exit process",
-            "probation period", "probation review",
-            "appraisal cycle", "performance review",
-            "employee handbook", "hr policy",
-            "working hours", "overtime pay", "attendance policy",
-            "reimbursement claim", "travel reimbursement",
-            "employee benefit", "gratuity", "pf ", "provident fund",
-            "offer letter", "joining formality",
-        ],
-        "Legal": [
-            "termination clause", "notice clause", "exit clause",
-            "liability clause", "indemnity clause", "penalty clause",
-            "confidentiality clause", "non-disclosure", "nda",
-            "intellectual property", "ip rights", "ip ownership",
-            "governing law", "jurisdiction", "dispute resolution",
-            "force majeure", "breach of contract", "remedy",
-            "non-compete", "non-solicitation",
-            "contract terms", "contract period", "agreement terms",
-            "legal obligation", "compliance requirement",
-            "arbitration", "mediation", "litigation",
-        ],
-        "Finance": [
-            "invoice", "billing", "payment terms", "payment schedule",
-            "budget", "budget allocation", "cost centre",
-            "tax", "gst", "tds", "withholding tax",
-            "payroll", "payroll cycle", "salary disbursement",
-            "expense claim", "expense reimbursement",
-            "purchase order", "po approval",
-            "financial report", "balance sheet", "profit loss",
-            "accounts payable", "accounts receivable",
-            "revenue recognition", "deferred revenue",
-            "audit", "financial audit", "internal audit",
-            "forex", "currency", "exchange rate",
-        ],
-        "Sales": [
-            "sales contract", "sales agreement", "sales policy",
-            "commission", "incentive structure", "variable pay",
-            "quota", "sales target", "revenue target",
-            "deal approval", "discount approval", "pricing policy",
-            "crm", "pipeline", "lead", "opportunity",
-            "customer agreement", "client contract",
-            "renewal", "upsell", "cross-sell",
-            "sales process", "sales cycle", "deal stage",
-            "territory", "account management",
-        ],
-        "IT": [
-            "system access", "access control", "user access",
-            "software license", "license agreement",
-            "data security", "information security", "cybersecurity",
-            "it policy", "acceptable use policy",
-            "infrastructure", "cloud", "server", "network",
-            "password policy", "mfa", "two-factor",
-            "data backup", "disaster recovery", "business continuity",
-            "it support", "helpdesk", "ticket system",
-            "software development", "deployment", "release process",
-            "api", "integration", "system architecture",
-        ],
-        "Operations": [
-            "vendor management", "vendor agreement", "vendor policy",
-            "sla", "service level agreement", "service level",
-            "procurement process", "sourcing process",
-            "delivery schedule", "logistics", "supply chain",
-            "quality control", "quality assurance", "qc process",
-            "operational process", "standard operating procedure", "sop",
-            "facility management", "office policy",
-            "asset management", "inventory",
-            "outsourcing", "third party",
-        ],
-        "Marketing": [
-            "marketing campaign", "campaign policy",
-            "brand guideline", "brand policy", "brand identity",
-            "content policy", "social media policy",
-            "advertising", "ad spend", "marketing budget",
-            "seo", "digital marketing", "email marketing",
-            "lead generation", "demand generation",
-            "marketing approval", "creative approval",
-            "event", "sponsorship", "pr policy",
-            "press release", "media policy",
-        ],
-        "Customer Support": [
-            "support ticket", "customer complaint", "complaint process",
-            "escalation policy", "escalation process",
-            "refund policy", "return policy", "cancellation policy",
-            "customer sla", "response time", "resolution time",
-            "support process", "support policy",
-            "customer satisfaction", "csat", "nps",
-            "warranty", "service warranty",
-            "knowledge base", "faq policy",
-        ],
-        "Product": [
-            "product roadmap", "feature request", "feature prioritization",
-            "sprint", "sprint planning", "backlog",
-            "release", "release process", "release notes",
-            "product policy", "product requirement",
-            "user story", "acceptance criteria",
-            "product launch", "go to market", "gtm",
-            "beta", "pilot", "mvp",
-            "product feedback", "user feedback",
-        ],
-        "Procurement": [
-            "purchase order", "po process", "po approval",
-            "supplier", "vendor selection", "vendor evaluation",
-            "rfq", "rfp", "request for proposal", "request for quotation",
-            "sourcing", "bid", "tender",
-            "contract award", "supplier contract",
-            "procurement policy", "buying policy",
-            "approved vendor list", "preferred supplier",
-            "goods receipt", "delivery terms", "incoterms",
-        ],
-    }
-
-    # ── Fallback query templates per department ───────────────────────────────
-    _DEPT_FALLBACK_TEMPLATES = {
-        "HR": [
-            "{q} employee handbook turabit HR policy",
-            "{q} leave entitlement salary employment terms",
-            "{q} resignation notice period probation appraisal",
-        ],
-        "Legal": [
-            "{q} contract clause legal terms obligations",
-            "{q} NDA non-disclosure agreement termination liability",
-            "{q} governing law jurisdiction dispute resolution indemnity",
-        ],
-        "Finance": [
-            "{q} invoice payment tax financial policy",
-            "{q} budget expense reimbursement payroll audit",
-            "{q} accounts billing purchase order finance procedure",
-        ],
-        "Sales": [
-            "{q} sales contract commission incentive policy",
-            "{q} deal approval pricing discount revenue target",
-            "{q} customer agreement renewal sales process",
-        ],
-        "IT": [
-            "{q} IT policy system access software license security",
-            "{q} data security infrastructure acceptable use",
-            "{q} helpdesk support deployment release process",
-        ],
-        "Operations": [
-            "{q} vendor SLA service level operational process",
-            "{q} procurement sourcing supply chain delivery",
-            "{q} standard operating procedure quality control",
-        ],
-        "Marketing": [
-            "{q} marketing policy brand guideline campaign approval",
-            "{q} content social media advertising spend",
-            "{q} digital marketing lead generation event sponsorship",
-        ],
-        "Customer Support": [
-            "{q} support policy escalation refund complaint process",
-            "{q} customer SLA response resolution time warranty",
-            "{q} ticket handling satisfaction feedback",
-        ],
-        "Product": [
-            "{q} product roadmap feature release sprint backlog",
-            "{q} product requirement user story acceptance criteria",
-            "{q} launch go-to-market feedback prioritization",
-        ],
-        "Procurement": [
-            "{q} purchase order supplier procurement policy",
-            "{q} RFQ RFP bid tender vendor selection contract award",
-            "{q} sourcing approved vendor delivery terms",
-        ],
-    }
-
-    # ── Detect which departments match this question ──────────────────────────
-    matched_depts = [
-        dept for dept, signals in _DEPT_SIGNALS.items()
-        if any(sig in q_lower for sig in signals)
-    ]
-
-    # ── Run second-pass only when first-pass is thin AND dept matched ─────────
-    if matched_depts and len(chunks) < 8:
-        seen       = {c["notion_page_id"] + c["heading"] for c in chunks}
-        embedder   = _get_embedder()
-        collection = _get_collection()
-
-        # Build all fallback queries for all matched departments
-        all_fallback_queries = []
-        for dept in matched_depts:
-            templates = _DEPT_FALLBACK_TEMPLATES.get(dept, [])
-            for tmpl in templates:
-                all_fallback_queries.append(tmpl.format(q=question))
-
-        # Run all queries in parallel
-        dept_results = await asyncio.gather(
-            *[_retrieve_single(fq, {}, 4, embedder, collection)
-              for fq in all_fallback_queries],
-            return_exceptions=True,
-        )
-
-        added = 0
-        for extras in dept_results:
-            if isinstance(extras, Exception):
-                continue
-            for c in extras:
-                uid = c["notion_page_id"] + c["heading"]
-                if uid not in seen:
-                    seen.add(uid)
-                    chunks.append(c)
-                    added += 1
-
-        chunks = sorted(chunks, key=lambda x: x["score"], reverse=True)[:top_k + 4]
-        logger.info(
-            "Dept second-pass [%s]: +%d chunks → now %d chunks from %d docs",
-            ", ".join(matched_depts), added,
-            len(chunks), len({c["doc_title"] for c in chunks}),
-        )
 
     # ── Rerank chunks for better context ────────────────────────────────────────
     chunks = await _rerank(question, chunks)
@@ -1071,19 +800,27 @@ async def tool_search(question: str, filters: dict,
     context = _build_context(chunks)
     history = await _get_history(session_id)
 
-    # ── Early not-found guard ─────────────────────────────────────────────────
+    # ── Early not-found guard WITH SELF-HEALING ────────────────────────────────
     quality_chunks = [c for c in chunks if c.get("score", 0) >= MIN_SCORE]
     if not quality_chunks:
-        not_found_answer = "I could not find information about this in the available documents."
-        result = {
-            "answer":     not_found_answer,
-            "citations":  _citations(chunks),
-            "chunks":     chunks,
-            "tool_used":  "search",
-            "confidence": "low",
-        }
-        await cache.set(a_key, result, ttl=600)
-        return result
+        logger.info("🔄 First-pass empty → triggering HyDE Self-Healing for: %s", question[:60])
+        answer, chunks = await _hyde_retry(question, filters, history, stream_queue)
+        if "could not find" in answer.lower():
+            # Truly not found even after HyDE
+            not_found_answer = "I could not find information about this in the available documents."
+            result = {
+                "answer":     not_found_answer,
+                "citations":  [],
+                "chunks":     [],
+                "tool_used":  "search",
+                "confidence": "low",
+            }
+            await cache.set(a_key, result, ttl=600)
+            return result
+        # If HyDE found something, we continue to the rest of the logic
+    
+    # Re-check quality chunks after potential HyDE
+    quality_chunks = [c for c in chunks if c.get("score", 0) >= MIN_SCORE]
 
     # ── LLM generates the answer from retrieved context ───────────────────────
     prompt_str = ANSWER_PROMPT.format(history=history, context=context, question=question)
@@ -1101,9 +838,9 @@ async def tool_search(question: str, filters: dict,
 
     # ── Self-verify: catch bad answers before returning ────────────────────────
     verdict = await _self_verify(question, answer)
-    if verdict == "BAD" and quality_chunks:
-        logger.info("🔄 Self-verify=BAD → retrying with HyDE for: %s", question[:60])
-        answer, chunks = await _hyde_retry(question, {}, history, stream_queue)
+    if verdict in ("BAD", "PARTIAL") and quality_chunks:
+        logger.info("🔄 Self-verify=%s → retrying with HyDE for: %s", verdict, question[:60])
+        answer, chunks = await _hyde_retry(question, filters, history, stream_queue)
 
     not_found = "could not find" in answer.lower()
 
@@ -1123,8 +860,21 @@ async def tool_search(question: str, filters: dict,
 
 
 async def tool_full_doc(question: str, filters: dict,
-                        session_id: str, stream_queue: asyncio.Queue = None) -> dict:
-    """For full document requests — retrieve more chunks with higher top_k."""
+                         session_id: str, stream_queue: asyncio.Queue = None) -> dict:
+    """
+    Retrieves the complete content or a broad set of chunks for a document.
+    
+    Used when the user asks for the 'full' or 'entire' version of a policy.
+    
+    Args:
+        question: The document name or request.
+        filters: Target filters (doc_title, etc.).
+        session_id: Client session ID.
+        stream_queue: Optional token stream queue.
+        
+    Returns:
+        A dictionary with the complete answer and relevant citations.
+    """
     # PERF: run retrieval and history in parallel
     chunks_coro  = _retrieve(question, filters, top_k=15)
     history_coro = _get_history(session_id)
@@ -1192,7 +942,26 @@ async def tool_refine(question: str, filters: dict,
 
 
 async def tool_compare(question: str, doc_a: str, doc_b: str,
-                       filters: dict, session_id: str, top_k: int = 6, stream_queue: asyncio.Queue = None) -> dict:
+                       filters: dict, session_id: str, top_k: int = 6, 
+                       stream_queue: asyncio.Queue = None) -> dict:
+    """
+    Compares two specific documents against a common question.
+    
+    Retrieves prioritized chunks for both documents and uses a structured
+    comparison prompt to generate a side-by-side analysis and a verdict.
+    
+    Args:
+        question: The aspect or question to compare (e.g., 'notice period').
+        doc_a: Title of the first document.
+        doc_b: Title of the second document.
+        filters: Shared filters.
+        session_id: Client session ID.
+        top_k: Number of chunks to retrieve per document.
+        stream_queue: Optional token stream queue.
+        
+    Returns:
+        A dictionary containing the parsed comparison results and citations.
+    """
 
     # Dynamic boost: only use legal terms if the question isn't specific
     _specialized = any(w in question.lower() for w in ["policy", "payment", "date", "term", "clause", "notice", "leave"])

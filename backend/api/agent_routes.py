@@ -42,14 +42,14 @@ class TicketCreateRequest(BaseModel):
     summary:           str = ""
     priority:          str = "Medium"  # "High" | "Medium" | "Low"
     confidence:        str = "low"
-    user_info:         str = "Admin"
+    user_info:         str = "Anonymous"
     ticket_id:         Optional[str] = None  # Manual override (e.g. 33312206)
     raw_chunks:        list = []
 
 
 class MemorySaveRequest(BaseModel):
     session_id: str
-    memory:     dict   # Profile hints like user_name, industry, etc.
+    memory:     dict   # Session context like last_doc, last_intent, etc.
 
 
 
@@ -270,8 +270,8 @@ async def update_ticket(req: TicketUpdateRequest):
 @router.post("/memory")
 async def save_memory(req: MemorySaveRequest):
     """
-    Save or update agent memory for the current session.
-    Used by the UI to persist user hints (name, context).
+    Save or update agent session context for the current session.
+    Used by the UI to persist session hints (last_doc, last_intent).
     """
     try:
         mem_key = f"docforge:agent:memory:{req.session_id}"
@@ -303,27 +303,27 @@ async def _create_notion_ticket(req: "TicketCreateRequest") -> dict:
     # ── Property names must EXACTLY match the Notion DB columns ──────────────
     properties: dict = {
         "Question": {
-            "title": [{"type": "text", "text": {"content": req.question[:2000]}}]
+            "title": [{"text": {"content": req.question[:2000]}}]
         },
         "Status":   {"select": {"name": "Open"}},
         "Priority": {"select": {"name": priority}},
         "User Info": {
-            "rich_text": [{"type": "text", "text": {"content": req.user_info or "Admin"}}]
+            "rich_text": [{"text": {"content": req.user_info or "Anonymous"}}]
         },
         "Created": {
             "date": {"start": live_date[:10]}
         },
         "Assigned Owner": {
-            "rich_text": [{"type": "text", "text": {"content": "Support Team"}}]
+            "rich_text": [{"text": {"content": "Support Team"}}]
         },
     }
     if req.summary:
         properties["Summary"] = {
-            "rich_text": [{"type": "text", "text": {"content": req.summary[:2000]}}]
+            "rich_text": [{"text": {"content": req.summary[:2000]}}]
         }
     if req.session_id:
         properties["Session ID"] = {
-            "rich_text": [{"type": "text", "text": {"content": req.session_id}}]
+            "rich_text": [{"text": {"content": req.session_id}}]
         }
     if req.attempted_sources:
         properties["Attempted Sources"] = {
@@ -334,7 +334,7 @@ async def _create_notion_ticket(req: "TicketCreateRequest") -> dict:
     ticket_id = manual_id if manual_id else "".join(random.choices("0123456789", k=8))
 
     properties["Ticket ID"] = {
-        "rich_text": [{"type": "text", "text": {"content": str(ticket_id)}}]
+        "rich_text": [{"text": {"content": str(ticket_id)}}]
     }
 
     payload = {"parent": {"database_id": db_id}, "properties": properties}
@@ -346,7 +346,7 @@ async def _create_notion_ticket(req: "TicketCreateRequest") -> dict:
             "object": "block",
             "type": "heading_2",
             "heading_2": {
-                "rich_text": [{"type": "text", "text": {"content": "Attempted Context (Snippets)"}}]
+                "rich_text": [{"text": {"content": "Attempted Context (Snippets)"}}]
             }
         })
         for c in req.raw_chunks[:5]:
@@ -357,8 +357,8 @@ async def _create_notion_ticket(req: "TicketCreateRequest") -> dict:
                 "type": "callout",
                 "callout": {
                     "rich_text": [
-                        {"type": "text", "text": {"content": f"Source: {doc_id}\n\n", "annotations": {"bold": True}}},
-                        {"type": "text", "text": {"content": text}}
+                        {"text": {"content": f"Source: {doc_id}\n\n"}, "annotations": {"bold": True}},
+                        {"text": {"content": text}}
                     ],
                     "icon": {"type": "emoji", "emoji": "📄"}
                 }

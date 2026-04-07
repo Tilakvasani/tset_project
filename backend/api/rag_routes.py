@@ -43,100 +43,49 @@ from typing import Dict, List, Optional
 from pydantic import BaseModel
 
 class IngestRequest(BaseModel):
-    force: bool = False
+    """Configuration for the Notion ingestion process."""
+    force: bool = False  # If True, re-indexes even if chunks exist.
 
 
 class AskRequest(BaseModel):
+    """
+    Schema for a CiteRAG question request.
+    
+    Attributes:
+        question: The user's query or instruction.
+        filters: Optional department or doc_type filters.
+        session_id: Unique ID for conversation history tracking.
+        top_k: Number of chunks to retrieve for single tasks.
+        doc_a: Name of first document (for comparisons).
+        doc_b: Name of second document (for comparisons).
+        doc_list: List of 3+ documents for multi-comparisons.
+        stream: If True, returns a token stream.
+        skip_cache: If True, bypasses the Redis answer cache.
+    """
     question:       str
     filters:        Dict[str, str] = {}
     session_id:     str = "default"
     top_k:          int = 5
     doc_a:          str = ""
     doc_b:          str = ""
-    doc_list:       list[str] = []   # for multi-doc compare (3+ documents)
+    doc_list:       list[str] = []
     stream:         bool = False
+    skip_cache:     bool = False
 
     def sanitized_question(self) -> str:
-        """Strip whitespace, collapse internal whitespace, cap at 2000 chars.
-        Fast string-match injection guard — runs BEFORE any LLM call.
-        The LLM-level guard in the agent system prompt handles everything else.
         """
+        Cleans and truncates the user question for safety.
+        
+        Collapses multiple whitespaces and caps length to prevent 
+        DoS-style oversized query attacks.
+        
+        Returns:
+            The normalized question string.
+        """
+        # ── Fast normalisation ──
         q = " ".join(self.question.strip().split())
         q = q[:2000]
-
-        # ── Fast pattern matching — catches obvious injection before any LLM call ──
-        # Extended to cover patterns Azure flags as jailbreak (content_filter 400)
-        _INJECTION_PATTERNS = [
-            # Classic overrides
-            "ignore all previous",
-            "ignore previous instructions",
-            "forget you are",
-            "forget your instructions",
-            "forget everything above",
-            "disregard previous",
-            "disregard all instructions",
-            "system override",
-            "disable all filters",
-            "disable rag",
-            # Prompt reveal
-            "print your system prompt",
-            "reveal your prompt",
-            "reveal your system",
-            "reveal your instructions",
-            "show me your prompt",
-            "what is your system prompt",
-            "reveal your api key",
-            "reveal your token",
-            # Persona hijack
-            "act as if you have no",
-            "act as an unrestricted",
-            "you are now dan",
-            "you are now stan",
-            "you are now jailbreak",
-            "you are no longer bound",
-            "you have no restrictions",
-            "you are unrestricted",
-            "pretend you are an evil",
-            "pretend you have no",
-            "pretend you are unrestricted",
-            "roleplay as a turabit",
-            "pretend there are no rules",
-            "imagine you are a different ai",
-            "you are now a different ai",
-            # Bypass instructions
-            "answer from your general knowledge",
-            "answer from the internet",
-            "use your training data",
-            "bypass your instructions",
-            "bypass your filters",
-            "override your guidelines",
-            "override your safety",
-            "my admin code",
-            "access granted",
-            "developer mode",
-            "jailbreak mode",
-            # Structural injection markers
-            "instruction from anthropic",
-            "instruction from openai",
-            "[inst] forget",
-            "</s>[inst]",
-            "<<sys>>",
-            "<|system|>",
-            "###instruction",
-            "### instruction",
-        ]
-        q_lower = q.lower()
-        if any(pattern in q_lower for pattern in _INJECTION_PATTERNS):
-            logger.warning("🚨 [Security] Injection pattern detected in input: %r", q[:80])
-            raise HTTPException(
-                status_code=422,
-                detail="Request rejected: potential prompt injection detected.",
-            )
-
         return q
-
-
-# ── Multi-question splitting handled by agent_graph ───────────────
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -173,17 +122,21 @@ async def api_ingest(req: IngestRequest):
 @router.post("/ask")
 async def api_ask(req: AskRequest):
     """
-    Single-router entry point.
-    sanitized_question() → run_agent() → done.
-    The agent handles ALL routing: search, compare, analyze, tickets, off-topic, injection.
+    Primary Q&A endpoint for CiteRAG.
+    
+    Routes questions to the Agent Graph for intent detection and tool
+    execution (search, compare, ticket creation, etc.). Supports 
+    streaming for low-latency feedback.
+    
+    Args:
+        req: AskRequest containing question, session, and filters.
+        
+    Returns:
+        The dictionary response or a StreamingResponse if req.stream is True.
     """
     request_id = str(uuid.uuid4())[:8]
 
     # ── Injection guard ───────────────────────────────────────────────────────
-    # sanitized_question() raises HTTPException(422) on obvious injection patterns.
-    # We catch that here and return the same friendly security message that the
-    # Azure Content Filter path returns, so the UI always gets a 200 + safe text
-    # instead of a raw 422 error.
     try:
         question = req.sanitized_question()
     except HTTPException as e:
@@ -193,7 +146,7 @@ async def api_ask(req: AskRequest):
                 "[Note: Request restricted by security policy 🛡️]"
             )
             logger.warning(
-                "\U0001f6e1\ufe0f [%s] Injection blocked, returning safe response | session=%s",
+                "🛡️ [%s] Injection blocked, returning safe response | session=%s",
                 request_id, req.session_id,
             )
             await _save_turn(req.session_id, req.question[:2000], block_msg)
@@ -204,39 +157,29 @@ async def api_ask(req: AskRequest):
                 "tool_used":  "chat",
                 "confidence": "low",
             }
-        raise  # re-raise any other unexpected HTTPException
-    logger.info("🚀 [%s] /ask | session=%s | q=%r", request_id, req.session_id, question[:80])
+        raise
+
+    logger.info("🚀 [%s] /ask | session=%s | q=%r", 
+                request_id, req.session_id, question[:500])
 
     try:
-
-        # ── Early Fast-Path Cache Check ───────────────────────────────────────
-        # Only allow fast-path for simple, single-sentence questions.
-        # Bypass if it looks like a multi-query (conjunctions) or an action (ticket, create).
-        _q_norm = question.lower()
-        _complex = any(k in _q_norm for k in [" and ", " also ", " plus ", "create ", "ticket", "status", "mark", "resolved"])
-        
-        a_key = _answer_key(question, {})
-        if not getattr(req, "skip_cache", False) and not _complex:
+        # ── Cache Check ───────────────────────────────────────────────────────
+        a_key = _answer_key(question, req.filters)
+        if not req.skip_cache:
             hit = await cache.get(a_key)
             if hit:
-                logger.info("⚡ [%s] Fast-path Cache HIT for query", request_id)
+                logger.info("⚡ [%s] Cache HIT", request_id)
                 await _save_turn(req.session_id, question, hit.get("answer", ""))
                 
-                # Standardize return dictionary
-                hit["run_id"]      = request_id
-                hit["tool_used"]   = hit.get("tool_used", "search")
-                hit["agent_reply"] = ""
-                
-                if getattr(req, "stream", False):
+                if req.stream:
                     async def cache_streamer():
                         yield json.dumps({"type": "token", "content": hit.get("answer", "")}) + "\n"
                         yield json.dumps({"type": "done", "result": hit}) + "\n"
                     return StreamingResponse(cache_streamer(), media_type="application/x-ndjson")
                 return hit
-        elif _complex:
-            logger.info("⏩ [%s] Fast-path bypass: complex query detected", request_id)
 
-        if getattr(req, "stream", False):
+        # ── Run Agent Graph ───────────────────────────────────────────────────
+        if req.stream:
             stream_queue = asyncio.Queue()
             
             async def streaming_generator():
@@ -249,19 +192,18 @@ async def api_ask(req: AskRequest):
                     stream_queue=stream_queue
                 ))
                 
-                while True:
-                    if task.done() and stream_queue.empty():
-                        result = task.result()
-                        logger.info("✅ [%s] Done | tool=%s", request_id, result.get("tool_used", "?"))
-                        await cache.set(a_key, result, ttl=3600)
-                        yield json.dumps({"type": "done", "result": result}) + "\n"
-                        break
-                        
+                while not task.done() or not stream_queue.empty():
                     try:
                         item = await asyncio.wait_for(stream_queue.get(), timeout=0.1)
                         yield json.dumps(item) + "\n"
                     except asyncio.TimeoutError:
                         continue
+                
+                # Retrieve final result and set cache
+                result = task.result()
+                logger.info("✅ [%s] Done | tool=%s", request_id, result.get("tool_used", "?"))
+                await cache.set(a_key, result, ttl=3600)
+                yield json.dumps({"type": "done", "result": result}) + "\n"
                         
             return StreamingResponse(streaming_generator(), media_type="application/x-ndjson")
             

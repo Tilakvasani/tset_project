@@ -48,6 +48,7 @@ from langgraph.graph import StateGraph, END, START
 
 # ── Internal ──────────────────────────────────────────────────────────────────
 from backend.services.redis_service import cache
+
 from backend.rag.system_prompt import build_system_prompt, HISTORY_SUMMARY_PROMPT
 from backend.core.logger import logger
 from backend.rag.rag_service import (
@@ -75,15 +76,14 @@ TOOLS = [
         "function": {
             "name": "search",
             "description": (
-                "Search turabit's internal documents to answer a SINGLE question. "
-                "ONLY use this for individual, straightforward lookups. "
-                "If the query involves comparison, audit, full document retrieval, "
-                "or actions like ticket creation, you MUST pick a more specific tool."
+                "ONLY use this for a SINGLE, straightforward lookup. "
+                "If the query involves multiple questions, or this task AND another task "
+                "(like a comparison, summary, or ticket), you MUST use **multi_query** instead."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "question": {"type": "string", "description": "ONE clean question ONLY"}
+                    "question": {"type": "string", "description": "The EXACT question, translated into professional English if not already in English. MUST be ONE clean question ONLY."}
                 },
                 "required": ["question"],
             },
@@ -94,9 +94,8 @@ TOOLS = [
         "function": {
             "name": "compare",
             "description": (
-                "Compare exactly TWO turabit documents side-by-side on a specific question. "
-                "Use when the user explicitly names two documents: "
-                "'compare NDA vs Employment Contract', 'NDA vs MSA', etc."
+                "Use ONLY for a SINGLE comparison task. If the user asks for a comparison AND another "
+                "task (like a summary or ticket), you MUST use **multi_query** instead."
             ),
             "parameters": {
                 "type": "object",
@@ -131,10 +130,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "analyze",
-            "description": (
-                "Perform a deep audit, gap analysis, or contradiction check on documents. "
-                "MANDATORY keywords that trigger this: 'audit', 'gap', 'contradiction', 'risk', 'issue', 'contradict'."
-            ),
+            "description": "Analyze documents for risks, gaps, contradictions, or non-compliance. Use this when the user asks for an audit, risk assessment, or identifies a potential conflict between policies.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -148,10 +144,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "summarize",
-            "description": (
-                "Summarize a specific document or policy. "
-                "MANDATORY keywords that trigger this: 'summarize', 'overview', 'TL;DR', 'key points', 'summary'."
-            ),
+            "description": "Generate a concise summary or TL;DR of a specific document. Use this when the user wants an overview, key points, or a high-level briefing on a single policy or contract.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -166,14 +159,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "full_doc",
-            "description": (
-                "Retrieve the full content of a turabit document. "
-                "Use when user says: 'show me the full contract', 'entire NDA', 'complete handbook'."
-            ),
+            "description": "Retrieve the complete content of a document. Use this when the user asks for the 'full', 'entire', or 'complete' version of a policy, or wants to see the whole contract.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "question": {"type": "string", "description": "The full document request"}
+                    "question": {"type": "string", "description": "The document request"}
                 },
                 "required": ["question"],
             },
@@ -209,10 +199,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "create_ticket",
-            "description": (
-                "Create a support ticket for unanswered questions. "
-                "Use when user says: 'create ticket', 'raise issue', 'open a ticket', 'log this'."
-            ),
+            "description": "Create a support ticket.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -309,11 +296,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "multi_query",
-            "description": (
-                "Split a complex or mixed-intent message into independent sub-tasks. "
-                "MANDATORY: Use this if the message contains TWO or MORE distinct thoughts, "
-                "even if they are related (e.g., 'Who is X and who is Y' or 'Analyze X and summarize Y')."
-            ),
+            "description": "The Master Router. Use this if the message contains multiple distinct thoughts, sequential tasks, or both an action and a question. This ensures every part of the user's intent is processed separately.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -348,6 +331,7 @@ class AgentState(TypedDict, total=False):
     # Context
     history:       list
     memory:        dict
+    # User identity tracking removed for anonymity
 
     # Router output
     tool_name:     str
@@ -447,6 +431,7 @@ async def _save_history(session_id: str, history: list):
     )
 
 
+
 PROFILE_TTL = 2_592_000  # 30 days
 PROFILE_KEY = "docforge:agent:profile:{session_id}"
 
@@ -492,84 +477,14 @@ async def _update_profile(session_id: str, question: str, result: dict):
     await _save_profile(session_id, profile)
 
 
+
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MULTI-QUERY HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _is_likely_multi(text: str) -> bool:
-    """Fast heuristic: detect multi-part questions BEFORE the LLM router.
-    
-    Catches patterns like:
-      - 2+ question marks: "What is X? Who is Y?"
-      - Mixed-intent conjunctions: "compare X and who is Y"
-      - Numbered items: "1. what is X 2. who is Y"
-      - Semicolons: "tell me about X; also who is Y"
-      - Explicit multi-signals: "and also", "plus", "as well as"
-    """
-    text_lower = text.lower().strip()
-    
-    # 1. Multiple question marks → almost always multi-intent
-    if text.count("?") >= 2:
-        return True
-    
-    # 2. Semicolons separating clauses
-    if ";" in text and len(text.split(";")) >= 2:
-        parts = [p.strip() for p in text.split(";") if len(p.strip().split()) >= 3]
-        if len(parts) >= 2:
-            return True
-    
-    # 3. Numbered items: "1. X 2. Y" or "1) X 2) Y"
-    import re as _re
-    numbered = _re.findall(r'(?:^|\s)(\d+)[.)]\s', text_lower)
-    if len(numbered) >= 2:
-        return True
-    
-    # 4. Mixed-intent conjunctions: "X and who/what/how/why/when/where/tell/explain/find/give"
-    #    These join two DIFFERENT types of questions
-    _intent_boundary_signals = [
-        " and who ", " and what ", " and how ", " and why ", " and when ",
-        " and where ", " and tell ", " and explain ", " and find ",
-        " and give ", " and show ", " and list ", " and describe ",
-        " and compare ", " and analyze ", " and check ",
-        " aur kaun ", " aur kya ", " aur bata ",
-    ]
-    for signal in _intent_boundary_signals:
-        if signal in text_lower:
-            return True
-    
-    # 5. "also tell me", "also who", "also what", "also explain"
-    _also_patterns = [
-        " also who ", " also what ", " also how ", " also tell ",
-        " also find ", " also explain ", " also show ", " also list ",
-        " also check ", " also compare ", " also give ",
-    ]
-    for pat in _also_patterns:
-        if pat in text_lower:
-            return True
-    
-    # 6. Classic multi-signals with word-count check
-    _multi_signals = [
-        " and also ", " plus ", " as well as ",
-        " along with ", " additionally ", " aur ", " bhi ",
-        " then ", " after that ", " uske baad ",
-        " moreover ", " furthermore ", " in addition ",
-        " then summarize ", " then find ", " then create ",
-    ]
-    for signal in _multi_signals:
-        if signal in text_lower:
-            parts = text_lower.split(signal, 1)
-            # Relax count requirement if it's a clear sequential action
-            if " then " in signal or " aur " in signal:
-                return True
-            if all(len(p.split()) >= 2 for p in parts):
-                return True
-    
-    # 7. Lists using "and" between multiple named entities
-    # "Who is Rahul and who is Tilak?"
-    if " and " in text_lower and text_lower.count(" who ") >= 2:
-        return True
-    
-    return False
+
 
 
 def _merge_multi_results(sub_questions: list, sub_results: list) -> dict:
@@ -644,15 +559,8 @@ async def _detect_priority_async(question: str) -> str:
         logger.info("🎯 [Priority] LLM classified: %s for: %s", priority, question[:60])
         return priority
     except Exception as e:
-        logger.warning("Priority LLM failed: %s — keyword fallback", e)
-        _fallback_signals = [
-            "password", "login", "access denied", "blocked", "unauthorized",
-            "security", "breach", "data leak", "hacked", "legal", "lawsuit",
-            "compliance", "gdpr", "audit", "contract", "nda", "termination",
-            "salary", "payment", "payroll", "invoice", "not paid", "overdue",
-            "urgent", "asap", "critical", "emergency", "broken", "down", "outage",
-        ]
-        return "High" if any(s in question.lower() for s in _fallback_signals) else "Low"
+        logger.warning("Priority LLM failed: %s — defaulting to Low", e)
+        return "Low"
 
 
 
@@ -676,7 +584,7 @@ _OFF_TOPIC_MSG = (
 )
 _INJECTION_MSG = (
     "I can't process that request. "
-    "I'm designed to answer questions about Turabit's internal documents only."
+    "[Note: This request was restricted by Turabit's security policy to prevent prompt injection or unauthorised access 🛡️]"
 )
 
 def _block_response(reason: str) -> tuple:
@@ -1005,8 +913,16 @@ async def _make_ticket(
 
 async def node_load_context(state: AgentState) -> AgentState:
     """
-    Node 1: Loads Redis history, Redis memory, and builds the Dynamic System Prompt.
-    By doing it inside the graph vs outside, we ensure fresh context every turn.
+    Node 1: Initial context loader.
+    
+    Loads conversation history and user memory from Redis and injects
+    the dynamic system prompt (document-aware) into the message state.
+    
+    Args:
+        state: The current LangGraph agent state.
+        
+    Returns:
+        The updated state with history, memory, and system prompt.
     """
     session_id = state["session_id"]
     state["history"] = await _load_history(session_id)
@@ -1015,12 +931,12 @@ async def node_load_context(state: AgentState) -> AgentState:
     # Convert the memory dict into a string for the system prompt
     memory_str = json.dumps(state["memory"], indent=2) if state["memory"] else "No memory saved yet."
 
-    # Use the dynamic system prompt
+    # Use the dynamic system prompt (now anonymous)
     system_prompt = await build_system_prompt()
 
     if memory_str != "No memory saved yet.":
         system_prompt += f"\n\n════════════════════════════════════════════════════════════════\nMEMORY\n════════════════════════════════════════════════════════════════\n{memory_str}\n"
-
+    
     # Insert it at the TOP of the history (before user messages)
     state["history"].insert(0, {"role": "system", "content": system_prompt})
 
@@ -1053,9 +969,16 @@ async def _exec_chat_summary(history: list, question: str, stream_queue: Any = N
 
 async def node_route(state: AgentState) -> AgentState:
     """
-    Node 3b: Single LLM call that selects ONE tool.
-    Populates state.tool_name and state.tool_args.
-    Includes pre-router multi-query heuristic detection.
+    Node 3b: Single LLM routing node.
+    
+    Calls the LLM to select the most appropriate tool (search, compare, etc.) 
+    based on the question and history.
+    
+    Args:
+        state: The current LangGraph agent state.
+        
+    Returns:
+        The state updated with 'tool_name' and 'tool_args'.
     """
 
     question = state["question"]
@@ -1064,37 +987,7 @@ async def node_route(state: AgentState) -> AgentState:
     doc_b    = state.get("doc_b", "")
     doc_list = state.get("doc_list")
 
-    # ── Pre-router multi-query detection (heuristic) ─────────────────────────
-    if not state.get("is_multi") and _is_likely_multi(question):
-        logger.info("🔀 Pre-router: Multi-query detected heuristically for: %s", question[:60])
-        try:
-            split_prompt = (
-                "You are splitting a multi-part user query into independent sub-questions.\n\n"
-                "RULES:\n"
-                "1. Split ONLY at intent boundaries — where the user is asking for DIFFERENT things.\n"
-                "2. NEVER decompose a compare/analyze/summarize request into sub-parts.\n"
-                "   - 'compare NDA vs SOW' = 1 sub-question (keep as-is)\n"
-                "   - 'compare NDA vs SOW and who is Rahul' = 2 sub-questions\n"
-                "3. Keep each sub-question complete and standalone.\n"
-                "4. Preserve exact document names mentioned in the original.\n"
-                "5. Return 2-4 sub-questions max.\n\n"
-                "Return ONLY a JSON array of strings, nothing else.\n\n"
-                f"Query: {question}"
-            )
-            resp = await _get_llm().ainvoke(split_prompt)
-            raw = resp.content.strip()
-            if raw.startswith("```json"):
-                raw = raw[7:-3].strip()
-            elif raw.startswith("```"):
-                raw = raw[3:-3].strip()
-            subs = json.loads(raw)
-            if isinstance(subs, list) and len(subs) >= 2:
-                logger.info("🔀 Pre-router: Split into %d sub-questions: %s", len(subs), subs)
-                return {**state, "tool_name": "multi_query",
-                        "tool_args": {"sub_questions": subs}}
-        except Exception as e:
-            logger.warning("Pre-router multi-query split failed: %s — falling through to LLM router", e)
-
+    # ── Build the final system prompt ─────────────────────────────────
     prompt_text = await build_system_prompt()
     messages    = [{"role": "system", "content": prompt_text}]
     messages.extend(history)
@@ -1104,6 +997,7 @@ async def node_route(state: AgentState) -> AgentState:
         user_content = f"{question}\n[Documents to compare: {', '.join(doc_list)}]"
     elif doc_a and doc_b:
         user_content = f"{question}\n[Documents: doc_a={doc_a}, doc_b={doc_b}]"
+    
     messages.append({"role": "user", "content": user_content})
 
     tool_name = "search"
@@ -1129,7 +1023,7 @@ async def node_route(state: AgentState) -> AgentState:
             tool_args = tc.get("args", {})
             if hasattr(response, "content"):
                 response.content = ""
-        logger.info("🔧 [Router] Tool: %s  args=%s", tool_name, str(tool_args)[:120])
+        logger.info("🔧 [Router] Tool: %s  args=%s", tool_name, str(tool_args)[:500])
     except Exception as e:
         err_str = str(e)
         if "content_filter" in err_str or "ResponsibleAIPolicyViolation" in err_str:
@@ -1317,21 +1211,6 @@ async def node_execute_tool(state: AgentState) -> AgentState:
     # Ensure result['answer'] exists for multi_query merging
     if reply and not result.get("answer"):
         result["answer"] = reply
-        
-    # ── Friendly Ticket Interception Note ──
-    try:
-        q_lower = question.lower()
-        asked_for_ticket = any(x in q_lower for x in ["create a ticket", "raise a ticket", "create ticket", "open ticket", "raise issue", "log this", "log a ticket"])
-        if asked_for_ticket and tool_name not in ("create_ticket", "update_ticket", "cancel", "multi_query", "block_off_topic"):
-            note = "\n\n> ℹ️ **Note:** I found the answer to your question immediately, so I skipped creating a support ticket to save you time! Let me know if you still need one."
-            result["answer"] += note
-            reply += note
-            stream_queue = state.get("stream_queue")
-            if stream_queue:
-                await stream_queue.put({"type": "token", "content": note})
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning("Failed to append ticket interception note: %s", e)
 
     return {**state, "result": result, "reply": reply}
 
@@ -1356,14 +1235,8 @@ async def node_save_history(state: AgentState) -> AgentState:
         existing.append({"role": "assistant",  "content": reply})
         await _save_history(session_id, existing)
 
-    # Update cross-session user profile (non-blocking)
-    result = state.get("result", {})
-    try:
-        await _update_profile(session_id, question, result)
-    except Exception:
-        pass  # profile update is best-effort
-
     return state
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1392,6 +1265,7 @@ def _build_graph():
 
 # Singleton compiled graph
 _graph = _build_graph()
+# _graph.get_graph().draw_png("agent_graph.png")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

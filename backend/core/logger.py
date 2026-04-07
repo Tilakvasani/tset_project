@@ -43,11 +43,25 @@ _MODULE_ALIASES = {
 
 class _PrettyFormatter(logging.Formatter):
     """
-    Compact, emoji-prefixed formatter.
-    Format:  HH:MM:SS  EMOJI  [module]  message
+    Compact, emoji-prefixed formatter for console output.
+    
+    Generates a log line in the format:
+      [HH:MM:SS] [EMOJI] [MODULE] [MESSAGE]
+    
+    Attributes:
+        datefmt (str): Format string for the timestamp.
     """
 
     def format(self, record: logging.LogRecord) -> str:
+        """
+        Formats a LogRecord into a pretty console string.
+        
+        Args:
+            record: The logging.LogRecord to format.
+            
+        Returns:
+            The formatted string with emoji and shortened module names.
+        """
         # Time — only HH:MM:SS, no date
         time_str = self.formatTime(record, "%H:%M:%S")
 
@@ -71,6 +85,14 @@ class _PrettyFormatter(logging.Formatter):
 
 
 def _setup_logging():
+    """
+    Initializes the global logging configuration.
+    
+    - Sets the log level from settings.
+    - Attaches the _PrettyFormatter to the stream handler.
+    - silences noisy third-party libraries (httpx, urllib3, etc.).
+    - Configures uvicorn access logs to be less verbose in production.
+    """
     level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
 
     handler = logging.StreamHandler(sys.stdout)
