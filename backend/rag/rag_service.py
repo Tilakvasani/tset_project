@@ -24,6 +24,7 @@ from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
 from backend.core.config import settings
 from backend.core.logger import logger
 from backend.services.redis_service import cache
+from backend.core.llm import get_llm as _core_get_llm  # H2+M1 FIX: shared race-free factory
 
 
 COLLECTION_NAME = "rag_chunks"
@@ -327,36 +328,13 @@ Question: {question}"""
 #  SINGLETON CLIENTS  (created once, reused)
 # ══════════════════════════════════════════════════════════════════════════════
 
-_llm_instance        = None
 _embedder_instance   = None
 _collection_instance = None
 
 
 def _get_llm(temperature: float = 0.2, max_tokens: int = 3000):
-    global _llm_instance
-    
-    # If using defaults, try to return singleton
-    if temperature == 0.2 and max_tokens == 3000:
-        if _llm_instance is None:
-            _llm_instance = AzureChatOpenAI(
-                azure_endpoint=settings.AZURE_LLM_ENDPOINT,
-                api_key=settings.AZURE_OPENAI_LLM_KEY,
-                azure_deployment=settings.AZURE_LLM_DEPLOYMENT_41_MINI,
-                api_version="2024-12-01-preview",
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-        return _llm_instance
-    
-    # Otherwise return a fresh instance for specialized tasks (e.g. history compression)
-    return AzureChatOpenAI(
-        azure_endpoint=settings.AZURE_LLM_ENDPOINT,
-        api_key=settings.AZURE_OPENAI_LLM_KEY,
-        azure_deployment=settings.AZURE_LLM_DEPLOYMENT_41_MINI,
-        api_version="2024-12-01-preview",
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )   
+    """Wrapper around the shared core LLM factory. Preserved for compatibility."""
+    return _core_get_llm(temperature=temperature, max_tokens=max_tokens)
 
 
 def _get_embedder():
@@ -375,7 +353,10 @@ def _get_collection():
     global _collection_instance
     if _collection_instance is None:
         client = chromadb.PersistentClient(path=settings.CHROMA_PATH)
-        _collection_instance = client.get_or_create_collection(name="rag_chunks")
+        _collection_instance = client.get_or_create_collection(
+            name="rag_chunks",
+            metadata={"hnsw:space": "cosine"},  # M5 FIX: match ingest_service — use cosine distance
+        )
     return _collection_instance
 # ══════════════════════════════════════════════════════════════════════════════
 #  LANGUAGE + CACHE HELPERS
@@ -506,32 +487,31 @@ async def _retrieve(query: str, filters: dict, top_k: int = 8) -> list:
         sec_num   = _section_match.group(2)  # e.g. "27"
         sec_ref   = f"{sec_label} {sec_num}"  # e.g. "section 27"
         logger.info("📑 [Section Boost] Detected reference: '%s'", sec_ref)
-        # Search ChromaDB with a larger pool and filter by content containing the reference
+        # Search ChromaDB natively using $contains to avoid pulling 200 chunks into memory
         try:
             count = collection.count()
             if count > 0:
+                # M5 FIX: Push substring filtering down to ChromaDB instead of python memory loop
                 broad_results = collection.get(
+                    where_document={"$contains": sec_ref.lower()},
                     include=["documents", "metadatas"],
-                    limit=min(count, 200),
+                    limit=15,
                 )
                 docs = broad_results.get("documents", [])
                 metas = broad_results.get("metadatas", [])
+                
                 for doc_text, meta in zip(docs, metas):
-                    # Check if this chunk's content or heading contains the section reference
-                    text_lower = doc_text.lower()
-                    heading_lower = (meta.get("heading", "") or "").lower()
-                    if sec_ref.lower() in text_lower or sec_ref.lower() in heading_lower:
-                        section_boost_chunks.append({
-                            "score":          0.85,  # High synthetic score — exact match
-                            "notion_page_id": meta.get("notion_page_id", ""),
-                            "doc_title":      meta.get("doc_title", ""),
-                            "doc_type":       meta.get("doc_type", ""),
-                            "department":     meta.get("department", ""),
-                            "version":        meta.get("version", ""),
-                            "heading":        meta.get("heading", ""),
-                            "content":        doc_text,
-                            "citation":       meta.get("citation", ""),
-                        })
+                    section_boost_chunks.append({
+                        "score":          0.85,  # High synthetic score — exact match
+                        "notion_page_id": meta.get("notion_page_id", ""),
+                        "doc_title":      meta.get("doc_title", ""),
+                        "doc_type":       meta.get("doc_type", ""),
+                        "department":     meta.get("department", ""),
+                        "version":        meta.get("version", ""),
+                        "heading":        meta.get("heading", ""),
+                        "content":        doc_text,
+                        "citation":       meta.get("citation", ""),
+                    })
                 if section_boost_chunks:
                     logger.info("📑 [Section Boost] Found %d chunks containing '%s'",
                                 len(section_boost_chunks), sec_ref)

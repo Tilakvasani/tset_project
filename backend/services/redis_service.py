@@ -63,9 +63,10 @@ class RedisCache:
         App continues normally if this returns False.
         """
         if url:
-            self._url = url
+            self._url = url  # persist the URL for reconnects
         try:
-            client = aioredis.from_url(url, encoding="utf-8",
+            client = aioredis.from_url(self._url,  # C2 FIX: always use self._url
+                                       encoding="utf-8",
                                        decode_responses=True,
                                        socket_connect_timeout=5,
                                        socket_timeout=5,
@@ -75,7 +76,7 @@ class RedisCache:
             self._redis = client
             self._available = True
             self._last_fail_time = 0.0
-            logger.info("✅ Redis connected at %s", url)
+            logger.info("✅ Redis connected at %s", self._url)
             return True
         except Exception as e:
             self._available = False

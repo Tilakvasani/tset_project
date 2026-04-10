@@ -164,6 +164,9 @@ async def get_tickets():
         cursor   = None
         async with _httpx.AsyncClient(timeout=30) as client:
             while True:
+                # M10 FIX: build a fresh body dict per iteration instead of mutating a shared one.
+                # Previous code did body.pop("start_cursor") then re-set it — correct but brittle.
+                body = {"page_size": 100}
                 if cursor:
                     body["start_cursor"] = cursor
                 resp = await client.post(
@@ -189,7 +192,9 @@ async def get_tickets():
                 if not data.get("has_more"):
                     break
                 cursor = data.get("next_cursor")
-                body.pop("start_cursor", None)
+                if not cursor:
+                    # L3 FIX: Guards against infinite refetching if Notion returns '' as cursor
+                    break
 
         # Sort by created_time descending (client-side, always safe)
         results.sort(key=lambda p: p.get("created_time", ""), reverse=True)

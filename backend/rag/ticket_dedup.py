@@ -25,8 +25,6 @@ Usage:
 """
 
 # ── Standard library ──────────────────────────────────────────────────────────
-import asyncio
-import logging
 from typing import Optional
 
 # ── Third-party ───────────────────────────────────────────────────────────────
@@ -36,7 +34,7 @@ import httpx  # async Notion API calls
 from backend.core.logger import logger
 from backend.services.notion_service import _headers as _notion_headers, NOTION_API_URL as NOTION_API
 from backend.api.agent_routes import _get_ticket_db_id
-from backend.rag.rag_service import _get_llm
+from backend.core.llm import get_llm as _get_llm  # M1 FIX: use shared factory
 
 # Max tickets sent to LLM to avoid huge prompts
 _MAX_TICKETS_FOR_LLM = 50
@@ -153,11 +151,9 @@ async def _llm_duplicate_check(new_question: str, tickets: list[dict]) -> Option
             new_question=new_question,
         )
 
-        # Run LLM in executor (it's a sync call)
-        raw = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: _get_llm().invoke(prompt).content.strip()
-        )
+        # C3 FIX: use ainvoke directly instead of deprecated get_event_loop + run_in_executor
+        resp = await _get_llm().ainvoke(prompt)
+        raw  = resp.content.strip()
 
         logger.debug("[dedup] LLM response: %s", raw)
 

@@ -1,6 +1,25 @@
 version: "3.9"
 
 services:
+  # ── PostgreSQL ────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-docforge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-docforge}
+      POSTGRES_DB:       ${POSTGRES_DB:-docforge}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-docforge} -d ${POSTGRES_DB:-docforge}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ─────────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
     ports:
@@ -12,6 +31,7 @@ services:
       timeout: 5s
       retries: 5
 
+  # ── Backend ───────────────────────────────────────────────────────────────────
   backend:
     build:
       context: .
@@ -20,13 +40,20 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      # M9 FIX: inject Postgres URL so backend finds DB out-of-the-box.
+      # Override in .env if using an external Postgres instance.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-docforge}:${POSTGRES_PASSWORD:-docforge}@postgres:5432/${POSTGRES_DB:-docforge}
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     volumes:
       - .:/app
     restart: always
 
+  # ── Frontend ──────────────────────────────────────────────────────────────────
   frontend:
     build:
       context: .
@@ -40,3 +67,6 @@ services:
     volumes:
       - .:/app
     restart: always
+
+volumes:
+  postgres_data:

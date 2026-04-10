@@ -40,7 +40,11 @@ router = APIRouter(prefix="/rag", tags=["RAG"])
 
 
 from typing import Dict, List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+# M2 FIX: Single definition of safe (idempotent) tools — only these are cached.
+_SAFE_TOOLS = frozenset({"search", "compare", "multi_compare", "multi_query", "full_doc", "analysis", "refine"})
+
 
 class IngestRequest(BaseModel):
     """Configuration for the Notion ingestion process."""
@@ -62,9 +66,10 @@ class AskRequest(BaseModel):
         stream: If True, returns a token stream.
         skip_cache: If True, bypasses the Redis answer cache.
     """
-    question:       str
+    # H5 FIX: Constrained fields to prevent oversized prompts and Redis key injection
+    question:       str = Field(..., max_length=2000)
     filters:        Dict[str, str] = {}
-    session_id:     str = "default"
+    session_id:     str = Field("default", max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
     top_k:          int = 5
     doc_a:          str = ""
     doc_b:          str = ""
@@ -183,35 +188,48 @@ async def api_ask(req: AskRequest):
             stream_queue = asyncio.Queue()
             
             async def streaming_generator():
-                task = asyncio.create_task(run_agent(
-                    question=question,
-                    session_id=req.session_id,
-                    doc_a=req.doc_a,
-                    doc_b=req.doc_b,
-                    doc_list=req.doc_list,
-                    stream_queue=stream_queue
-                ))
-                
-                while not task.done() or not stream_queue.empty():
+                # H2 FIX: sentinel-based drain — task signals completion by putting None on the queue,
+                # eliminating the 0.1s poll loop and its per-token tail latency.
+                async def _run_and_sentinel():
                     try:
-                        item = await asyncio.wait_for(stream_queue.get(), timeout=0.1)
-                        yield json.dumps(item) + "\n"
-                    except asyncio.TimeoutError:
-                        continue
-                
-                # ── Tool-based Cache Whitelist ────────────────────────────────
-                # We only cache idempotent "read" tools. Actions (create/update) are never cached.
-                _SAFE_TOOLS = {"search", "compare", "multi_compare", "multi_query", "full_doc", "analysis", "refine"}
-                
-                result = task.result()
+                        return await run_agent(
+                            question=question,
+                            session_id=req.session_id,
+                            doc_a=req.doc_a,
+                            doc_b=req.doc_b,
+                            doc_list=req.doc_list,
+                            stream_queue=stream_queue,
+                        )
+                    finally:
+                        await stream_queue.put(None)  # sentinel — always sent, even on error
+
+                task = asyncio.create_task(_run_and_sentinel())
+
+                # Drain queue until sentinel
+                while True:
+                    item = await stream_queue.get()
+                    if item is None:
+                        break
+                    yield json.dumps(item) + "\n"
+
+                # H3 FIX: Catch exceptions from run_agent and yield an error event
+                # instead of silently closing the stream.
+                try:
+                    result = task.result()
+                except Exception as agent_err:
+                    err_msg = str(agent_err)
+                    logger.error("❌ [%s] Streaming agent error: %s", request_id, agent_err)
+                    yield json.dumps({"type": "error", "message": err_msg}) + "\n"
+                    return
+
                 tool_used = result.get("tool_used", "chat")
                 logger.info("✅ [%s] Done | tool=%s", request_id, tool_used)
-                
-                if tool_used in _SAFE_TOOLS:
+
+                if tool_used in _SAFE_TOOLS:  # M2: use module-level constant
                     await cache.set(a_key, result, ttl=3600)
-                
+
                 yield json.dumps({"type": "done", "result": result}) + "\n"
-                        
+
             return StreamingResponse(streaming_generator(), media_type="application/x-ndjson")
             
         # Pass the full question to the agent graph, which will split it if needed.
@@ -226,10 +244,10 @@ async def api_ask(req: AskRequest):
         logger.info("✅ [%s] Done | tool=%s", request_id, result.get("tool_used", "?"))
         
         # ── Global Result Cache Save ──────────────────────────────────────────
-        # We only cache if the tool used was an idempotent RAG tool.
-        _SAFE_TOOLS = {"search", "compare", "multi_compare", "multi_query", "full_doc", "analysis", "refine"}
+        # Uses module-level _SAFE_TOOLS frozenset (defined at top of file).
+        # NOTE: Do NOT re-define _SAFE_TOOLS as a local variable here — doing so
+        # would poison the streaming_generator closure and cause a NameError.
         tool_used = result.get("tool_used", "chat")
-        
         if tool_used in _SAFE_TOOLS:
             await cache.set(a_key, result, ttl=3600)
         

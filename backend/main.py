@@ -26,6 +26,11 @@ from backend.api.routes import router as docforge_router
 from backend.api.rag_routes import router as rag_router
 from backend.api.agent_routes import router as agent_router
 
+try:
+    from backend.services.db_service import close_pool as _close_pg_pool
+except ImportError:
+    _close_pg_pool = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -61,6 +66,9 @@ async def lifespan(app: FastAPI):
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
     try:
+        if _close_pg_pool:
+            await _close_pg_pool()
+            logger.info("🐘 PostgreSQL pool closed")
         await cache.disconnect()
         logger.info("DocForge AI backend shutting down")
     except Exception as e:
@@ -74,9 +82,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Derive allowed origins from settings (comma-separated list in .env)
+_ALLOWED_ORIGINS = [o.strip() for o in settings.CORS_ALLOWED_ORIGINS.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_ALLOWED_ORIGINS,   # C1 FIX: explicit origins required when credentials=True
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

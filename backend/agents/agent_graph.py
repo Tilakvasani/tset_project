@@ -10,17 +10,16 @@ Architecture (LangGraph StateGraph):
   [load_context]          ← load Redis history + memory into state
     │
     ▼
-  [multi_query_split]     ← detect if user sent multiple questions
+  [route]                 ← LLM tool-call router (decides on 1 of 12 tools)
     │
-    ├─ is_multi=True ──▶ [fan_out]       ─── parallel sub-graphs ──▶ [save_history]
+    ▼
+  [execute_tool]          ← fires the matched tool handler natively (sequential execution)
     │
-    └─ is_multi=False ──▶ [route]        ← single LLM tool-call router
-                               │
-                          [execute_tool] ← fires one of 12 tool handlers
-                               │
-                          [save_history] ← write turn to Redis
-                               │
-                             END
+    ▼
+  [save_history]          ← write the final interaction to Redis
+    │
+    ▼
+   END
 
 State:
   AgentState (TypedDict) — flows through every node:
@@ -246,6 +245,21 @@ TOOLS = [
                     "question": {"type": "string"}
                 }
             }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_docs",
+            "description": (
+                "List all available documents that the user can ask about. "
+                "Use when user says: 'what documents do you have', 'show me all docs', "
+                "'list documents', 'what do you know about', 'what\'s available'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
         },
     },
     {
@@ -808,7 +822,11 @@ async def _exec_update_ticket(status: str, session_id: str, ticket_index: int = 
         if len(tickets) >= 2:
             targets = [tickets[-2]]
         else:
-            targets = [tickets[-1]]  # fallback to last if only 1
+            # L1 FIX: Tell the user the fallback happened instead of silently updating wrong ticket
+            targets = [tickets[-1]]
+            logger.info("[update_ticket] 'second last' requested but only 1 ticket — falling back to last")
+            # Prepend a note to the reply (handled below after results are built)
+            _fallback_note = "⚠️ Only one ticket exists — updating the most recent one instead.\n\n"
     else:
         idx = ticket_index - 1
         if not (0 <= idx < len(tickets)):
@@ -816,12 +834,19 @@ async def _exec_update_ticket(status: str, session_id: str, ticket_index: int = 
             return f"Please pick 1–{len(tickets)}:\n\n{lines}"
         targets = [tickets[idx]]
     try:
+        try:
+            # L5: Catch missing Notion Token ValueError gracefully instead of 500 crash
+            headers = _notion_headers()
+        except ValueError as e:
+            logger.error("[update_ticket] Missing Notion credentials: %s", e)
+            return "⚠️ **Configuration Error**: The Notion integration is not configured. Please add `NOTION_TOKEN` to your `.env` or UI Settings."
+
         async with httpx.AsyncClient(timeout=15) as client:
             results = []
             for t in targets:
                 resp = await client.patch(
                     f"{NOTION_API}/pages/{t['page_id']}",
-                    headers=_notion_headers(),
+                    headers=headers,
                     json={"properties": {"Status": {"select": {"name": status}}}},
                 )
                 resp.raise_for_status()
@@ -830,7 +855,10 @@ async def _exec_update_ticket(status: str, session_id: str, ticket_index: int = 
         memory["created_tickets"]    = tickets
         memory["last_ticket_status"] = status
         await _save_memory(session_id, memory)
-        return "\n\n".join(results)
+        reply_text = "\n\n".join(results)
+        if ticket_index == -3 and len(tickets) < 2:
+            reply_text = _fallback_note + reply_text
+        return reply_text
     except Exception as e:
         logger.error("update_ticket failed: %s", e)
         return f"⚠️ Could not update ticket status. Error: {e}"
@@ -847,18 +875,74 @@ async def _exec_cancel(session_id: str) -> str:
     return "👍 Cancelled."
 
 
+async def _exec_list_docs(session_id: str, stream_queue: Any = None) -> str:
+    """
+    L2 FIX: List all unique document titles currently available in ChromaDB.
+    Reuses the 5-minute cached list from system_prompt._fetch_live_doc_list()
+    so there's zero extra DB overhead on frequent invocations.
+    """
+    try:
+        from backend.rag.system_prompt import _fetch_live_doc_list
+        docs = await _fetch_live_doc_list()
+    except Exception as e:
+        logger.warning("list_docs: system_prompt fetch failed (%s) — querying ChromaDB directly", e)
+        try:
+            from backend.rag.rag_service import _get_collection
+            collection = _get_collection()
+            result     = collection.get(include=["metadatas"])
+            titles: set = {
+                (m or {}).get("doc_title", "").strip()
+                for m in (result.get("metadatas") or [])
+            }
+            docs = sorted(t for t in titles if t)
+        except Exception as e2:
+            logger.error("list_docs: ChromaDB fallback also failed: %s", e2)
+            docs = []
+
+    if not docs:
+        reply = (
+            "ℹ️ No documents are currently indexed in the knowledge base.\n\n"
+            "Ask an admin to run **Ingest from Notion** to add documents."
+        )
+    else:
+        lines = "\n".join(f"  {i + 1}. {d}" for i, d in enumerate(docs))
+        reply = (
+            f"📚 **{len(docs)} document{'s' if len(docs) != 1 else ''} available:**\n\n"
+            f"{lines}\n\n"
+            "You can ask me anything about any of these documents."
+        )
+
+    if stream_queue:
+        await stream_queue.put({"type": "token", "content": reply})
+
+    logger.info("list_docs: returned %d documents", len(docs))
+    return reply
+
+
+async def _bg_dedup_task(question: str, new_ticket_id: str, new_page_id: str):
+    dup = await find_duplicate(question)
+    if dup:
+        logger.info("Background dedup found duplicate. Archiving new ticket %s (duplicate of %s)", new_ticket_id, dup["ticket_id"])
+        from backend.services.notion_service import _headers as _notion_headers
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.patch(
+                    f"{NOTION_API}/pages/{new_page_id}",
+                    headers=_notion_headers(),
+                    json={"archived": True}
+                )
+        except Exception as e:
+            logger.warning("Failed to archive duplicate ticket %s: %s", new_ticket_id, e)
+
 async def _make_ticket(
     question: str, raw_chunks: list, session_id: str, memory: dict, ticket_id: str = None
 ) -> tuple:
-    dup = await find_duplicate(question)
-    if dup:
-        tid = dup["ticket_id"]
-        logger.info("🚫 Dedup blocked ticket=%s q='%s'", tid, question[:50])
-        return f"🎫 Ticket already exists for: **{question}**", tid
+    # S5 FIX: Do not block ticket creation on a 2-second LLM deduplication call.
     priority  = await _detect_priority_async(question)
     user_name = memory.get("user_name", "Admin")
     industry  = memory.get("industry", "")
     user_info = f"{user_name} ({industry})" if industry else user_name
+    
     req = TicketCreateRequest(
         question=question,
         session_id=session_id,
@@ -874,6 +958,10 @@ async def _make_ticket(
     tid     = result.get("ticket_id", "")
     page_id = result.get("page_id", "")
     url     = result.get("url", "")
+    
+    # Run the dedup in the background so the user gets an instant reply.
+    asyncio.create_task(_bg_dedup_task(question, tid, page_id))
+    
     memory["last_ticket_id"]  = tid
     memory["last_page_id"]    = page_id
     memory["last_ticket_url"] = url
@@ -892,14 +980,18 @@ async def _make_ticket(
 async def node_load_context(state: AgentState) -> AgentState:
     """
     Node 1: Initial context loader.
-    Loads raw history and memory, and prepares the 'Sandwich' history prompt.
+    Loads raw history, memory, and user profile; prepares the 'Sandwich' history prompt.
     """
     session_id = state["session_id"]
     raw_history = await _load_history(session_id)
-    
-    state["history"] = raw_history
-    state["memory"]  = await _load_memory(session_id)
+
+    state["history"]         = raw_history
+    state["memory"]          = await _load_memory(session_id)
     state["history_context"] = await _format_history_for_prompt(raw_history)
+
+    # L1 FIX: load cross-session user profile and store it for node_route to inject
+    profile = await _load_profile(session_id)
+    state["_user_profile"] = profile  # type: ignore[typeddict-item]  # runtime extra key
 
     return state
 
@@ -957,7 +1049,25 @@ async def node_route(state: AgentState) -> AgentState:
     doc_list = state.get("doc_list")
     # ── Build the final system prompt ─────────────────────────────────
     memory_str = json.dumps(state.get("memory", {}), indent=2) if state.get("memory") else "No memory saved yet."
-    prompt_text = await build_system_prompt()
+
+    # L1 FIX: format user profile for injection into system prompt
+    user_context_str = ""
+    profile = state.get("_user_profile") or {}
+    if profile:
+        parts = []
+        session_count = profile.get("session_count", 0)
+        if session_count:
+            parts.append(f"Sessions so far: {session_count}")
+        doc_interests = profile.get("doc_interests", [])
+        if doc_interests:
+            parts.append("Recently accessed docs: " + ", ".join(doc_interests[-5:]))
+        topics = profile.get("topics", [])
+        if topics:
+            parts.append("Recent activity: " + "; ".join(t.split(":", 1)[-1] for t in topics[-5:]))
+        if parts:
+            user_context_str = "\n".join(parts)
+
+    prompt_text = await build_system_prompt(user_context=user_context_str)
     
     if memory_str != "No memory saved yet.":
         prompt_text += f"\n\n[USER MEMORY]\n{memory_str}\n"
@@ -993,7 +1103,11 @@ async def node_route(state: AgentState) -> AgentState:
         response       = await llm_with_tools.ainvoke(messages)
         tool_calls     = getattr(response, "tool_calls", []) or []
         if not tool_calls:
-            logger.warning("LLM returned no tool call — defaulting to search")
+            # S4 FIX: Route to block_off_topic instead of silently falling back to search.
+            # search gives a confusing "no results" reply; block gives a real user-facing response.
+            logger.warning("LLM returned no tool call — routing to block_off_topic")
+            tool_name = "block_off_topic"
+            tool_args = {"reason": "off_topic"}
         else:
             tc        = tool_calls[0]
             tool_name = tc["name"]
@@ -1078,9 +1192,12 @@ async def node_execute_tool(state: AgentState) -> AgentState:
             reply  = result.get("answer", "")
 
         elif tool_name == "create_ticket":
+            # H4 FIX: Only pass ticket_id for genuine ID overrides.
+            # ticket_index is a numeric selection string ("1","2") — never use as a Notion ID.
+            manual_ticket_id = tool_args.get("ticket_id")  # only if LLM explicitly set an ID
             reply  = await _exec_create_ticket(
-                session_id, 
-                tool_args.get("ticket_id") or tool_args.get("ticket_index"),
+                session_id,
+                manual_ticket_id,
                 tool_args.get("question")
             )
             result = {"tool_used": "create_ticket", "confidence": "high", "citations": [], "chunks": []}
@@ -1104,9 +1221,8 @@ async def node_execute_tool(state: AgentState) -> AgentState:
         elif tool_name == "multi_query":
             # Allow both names for robustness
             sub_tasks = tool_args.get("sub_tasks") or tool_args.get("sub_questions") or []
-            doc_a   = state.get("doc_a", "")
-            doc_b   = state.get("doc_b", "")
-            doc_list= state.get("doc_list")
+            # M3 FIX: doc_a, doc_b, doc_list already defined at top of node_execute_tool
+            # (removed redundant re-declarations that shadowed the outer scope)
             
             async def _run_one_sub(q: str, inherit: bool) -> dict:
                 # Recursive sub-state (is_multi=True to prevent infinite loop)
@@ -1151,6 +1267,11 @@ async def node_execute_tool(state: AgentState) -> AgentState:
         elif tool_name == "chat_history_summary":
             reply  = await _exec_chat_summary(state.get("history", []), question, state.get("stream_queue"))
             result = {"tool_used": "chat_history_summary", "confidence": "high", "citations": [], "chunks": []}
+
+        elif tool_name == "list_docs":
+            # L2 FIX: new list_docs tool — reads unique doc_title values from ChromaDB
+            reply  = await _exec_list_docs(session_id, state.get("stream_queue"))
+            result = {"tool_used": "list_docs", "confidence": "high", "citations": [], "chunks": []}
 
         elif tool_name == "cancel":
             reply  = await _exec_cancel(session_id)

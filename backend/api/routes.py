@@ -131,8 +131,8 @@ async def api_generate_section(req: GenerateSectionRequest):
 
         # ── Quality gate: check generated content meets minimum standards ───────
         content    = result.get("content", "") if result else ""
-        doc_type   = getattr(req, "doc_type", "").lower().replace(" ", "_") if result else ""
-        passed, qc_note = check_quality(content, doc_type)
+        doc_type   = getattr(req, "doc_type", "") if result else ""
+        passed, qc_note = check_quality(content, doc_type)  # H1 FIX: normalise_doc_type called inside check_quality
         if not passed:
             logger.warning("⚠️  [QC FAIL] sec_id=%s doc_type=%s note=%s", req.sec_id, doc_type, qc_note)
         else:

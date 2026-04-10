@@ -415,7 +415,12 @@ async def _post_blocks_in_batches(page_id: str, blocks: list):
                     continue
                 break
             if resp.status_code not in (200, 201):
-                logger.error(f"Block append error {resp.status_code}: {resp.text[:200]}")
+                # M4 FIX: raise instead of silently continuing — prevents partial/corrupted Notion pages
+                error_detail = resp.text[:300]
+                logger.error(f"Block append error {resp.status_code}: {error_detail}")
+                raise RuntimeError(
+                    f"Notion block batch failed (HTTP {resp.status_code}): {error_detail}"
+                )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -459,13 +464,10 @@ async def _get_next_version(dept: str, doc_type: str) -> int:
             logger.info(f"No existing doc for dept='{dept}' type='{doc_type}' — starting at v1")
             return 1
 
-        existing_version = (
-            results[0]
-            .get("properties", {})
-            .get("Version", {})
-            .get("number", 1) or 1
-        )
-        next_version = int(existing_version) + 1
+        # M6 FIX: explicit None check — `0 or 1` would skip v1 if Notion returns 0
+        v = results[0].get("properties", {}).get("Version", {}).get("number")
+        existing_version = int(v) if v is not None else 0
+        next_version = existing_version + 1
         logger.info(f"Existing version found: v{existing_version} → publishing as v{next_version}")
         return next_version
 

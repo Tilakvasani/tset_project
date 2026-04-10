@@ -71,6 +71,8 @@ class Settings(BaseSettings):
     # ── App ───────────────────────────────────────────────────────────────────
     APP_ENV:                       str = "development"
     LOG_LEVEL:                     str = "INFO"
+    CORS_ALLOWED_ORIGINS:          str = "http://localhost:8501"  # Comma-separated list
+    IMGUR_CLIENT_ID:               Optional[str] = None          # For flowchart image hosting
 
     def model_post_init(self, __context):
         """

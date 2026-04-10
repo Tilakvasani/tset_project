@@ -10,6 +10,7 @@ from langchain_core.output_parsers import StrOutputParser
 
 from backend.core.config import settings
 from backend.core.logger import logger
+from backend.core.llm import get_llm          # H6+M1 FIX: shared factory, uses settings.AZURE_LLM_API_VERSION
 from backend.services.db_service import (
     save_questions, save_answers, get_qa_by_sec_id,
     update_section_content, get_generated_document,
@@ -82,18 +83,8 @@ SECTION_TYPE_PATTERNS = {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  LLM FACTORY
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_llm(temperature: float = 0.7) -> AzureChatOpenAI:
-    return AzureChatOpenAI(
-        azure_endpoint=settings.AZURE_LLM_ENDPOINT,
-        api_key=settings.AZURE_OPENAI_LLM_KEY,
-        azure_deployment=settings.AZURE_LLM_DEPLOYMENT_41_MINI,
-        api_version="2024-12-01-preview",
-        temperature=temperature,
-    )
+# Local get_llm removed — using backend.core.llm.get_llm directly (imported above).
+# This eliminates the hardcoded api_version and the duplicate factory.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -162,43 +153,43 @@ async def generate_questions(req: GenerateQuestionsRequest) -> dict:
 
     elif sec_type == SECTION_TYPE_TABLE:
         chain     = TABLE_QUESTIONS_PROMPT | get_llm(0.3) | StrOutputParser()
-        raw       = chain.invoke({
+        raw       = (await chain.ainvoke({       # H6 FIX: was chain.invoke (blocking)
             "section_name": sec_name,
             "doc_type":     doc_type,
             "department":   req.department,
             "company_name": ctx.get("company_name", "the company"),
             "industry":     ctx.get("industry", "general"),
             "table_hint":   meta.get("table_hint", f"Standard table for {sec_name}"),
-        }).strip()
+        })).strip()
         questions = _parse_questions(raw, max_q=3)
 
     elif sec_type == SECTION_TYPE_FLOWCHART:
         chain     = FLOWCHART_QUESTIONS_PROMPT | get_llm(0.3) | StrOutputParser()
-        raw       = chain.invoke({
+        raw       = (await chain.ainvoke({       # H6 FIX: was chain.invoke (blocking)
             "section_name":   sec_name,
             "doc_type":       doc_type,
             "department":     req.department,
             "company_name":   ctx.get("company_name", "the company"),
             "industry":       ctx.get("industry", "general"),
             "flowchart_hint": meta.get("flowchart_hint", f"Standard process flow for {sec_name}"),
-        }).strip()
+        })).strip()
         questions = _parse_questions(raw, max_q=3)
 
     elif sec_type == SECTION_TYPE_RACI:
         chain     = RACI_QUESTIONS_PROMPT | get_llm(0.3) | StrOutputParser()
-        raw       = chain.invoke({
+        raw       = (await chain.ainvoke({       # H6 FIX: was chain.invoke (blocking)
             "section_name": sec_name,
             "doc_type":     doc_type,
             "department":   req.department,
             "company_name": ctx.get("company_name", "the company"),
             "industry":     ctx.get("industry", "general"),
             "raci_hint":    meta.get("raci_hint", f"Standard RACI for {sec_name}"),
-        }).strip()
+        })).strip()
         questions = _parse_questions(raw, max_q=2)
 
     else:  # SECTION_TYPE_TEXT (default)
         chain     = TEXT_QUESTIONS_PROMPT | get_llm(0.3) | StrOutputParser()
-        raw       = chain.invoke({
+        raw       = (await chain.ainvoke({       # H6 FIX: was chain.invoke (blocking)
             "section_name": sec_name,
             "doc_type":     doc_type,
             "department":   req.department,
@@ -206,7 +197,7 @@ async def generate_questions(req: GenerateQuestionsRequest) -> dict:
             "industry":     ctx.get("industry", "general"),
             "company_size": ctx.get("company_size", "not specified"),
             "region":       ctx.get("region", "not specified"),
-        }).strip()
+        })).strip()
         questions = _parse_questions(raw, max_q=3)
 
     sec_id = await save_questions(
@@ -280,17 +271,17 @@ async def generate_section_content(req: GenerateSectionRequest) -> dict:
 
     if sec_type == SECTION_TYPE_SIGNATURE:
         chain = SECTION_SIGNATURE_PROMPT | get_llm(0.4) | StrOutputParser()
-        raw   = chain.invoke({
+        raw   = (await chain.ainvoke({          # H6 FIX: was chain.invoke (blocking)
             "doc_type":     req.doc_type,
             "department":   department,
             "company_name": company_name,
             "section_name": req.section_name,
-        })
-        clean = _clean_preserve_tables(raw.strip())
+        })).strip()
+        clean = _clean_preserve_tables(raw)
 
     elif sec_type == SECTION_TYPE_TABLE:
         chain = SECTION_TABLE_PROMPT | get_llm(0.5) | StrOutputParser()
-        raw   = chain.invoke({
+        raw   = (await chain.ainvoke({          # H6 FIX: was chain.invoke (blocking)
             "doc_type":     req.doc_type,
             "department":   department,
             "section_name": req.section_name,
@@ -299,13 +290,13 @@ async def generate_section_content(req: GenerateSectionRequest) -> dict:
             "region":       region,
             "qa_block":     qa_block,
             "table_hint":   meta.get("table_hint", f"Standard data table for {req.section_name}"),
-        })
-        clean = _clean_preserve_tables(raw.strip())
+        })).strip()
+        clean = _clean_preserve_tables(raw)
         logger.info(f"Table section '{req.section_name}' generated")
 
     elif sec_type == SECTION_TYPE_FLOWCHART:
         chain = SECTION_FLOWCHART_PROMPT | get_llm(0.5) | StrOutputParser()
-        raw   = chain.invoke({
+        raw   = (await chain.ainvoke({          # H6 FIX: was chain.invoke (blocking)
             "doc_type":       req.doc_type,
             "department":     department,
             "section_name":   req.section_name,
@@ -314,13 +305,13 @@ async def generate_section_content(req: GenerateSectionRequest) -> dict:
             "region":         region,
             "qa_block":       qa_block,
             "flowchart_hint": meta.get("flowchart_hint", f"Standard process flow for {req.section_name}"),
-        })
-        clean = _clean_preserve_flowcharts(raw.strip())
+        })).strip()
+        clean = _clean_preserve_flowcharts(raw)
         logger.info(f"Flowchart section '{req.section_name}' generated")
 
     elif sec_type == SECTION_TYPE_RACI:
         chain = SECTION_RACI_PROMPT | get_llm(0.4) | StrOutputParser()
-        raw   = chain.invoke({
+        raw   = (await chain.ainvoke({          # H6 FIX: was chain.invoke (blocking)
             "doc_type":     req.doc_type,
             "department":   department,
             "section_name": req.section_name,
@@ -329,14 +320,14 @@ async def generate_section_content(req: GenerateSectionRequest) -> dict:
             "region":       region,
             "qa_block":     qa_block,
             "raci_hint":    meta.get("raci_hint", f"Standard RACI matrix for {req.section_name}"),
-        })
-        clean = _clean_preserve_tables(raw.strip())
+        })).strip()
+        clean = _clean_preserve_tables(raw)
         logger.info(f"RACI section '{req.section_name}' generated")
 
     else:  # SECTION_TYPE_TEXT
         target_words = get_words_per_section(req.doc_type, req.num_sections or 10)
         chain        = SECTION_TEXT_PROMPT | get_llm(0.7) | StrOutputParser()
-        raw          = chain.invoke({
+        raw          = (await chain.ainvoke({   # H6 FIX: was chain.invoke (blocking)
             "doc_type":     req.doc_type,
             "department":   department,
             "section_name": req.section_name,
@@ -346,8 +337,8 @@ async def generate_section_content(req: GenerateSectionRequest) -> dict:
             "region":       region,
             "qa_block":     qa_block,
             "target_words": target_words,
-        })
-        clean = _clean_preserve_tables(raw.strip())
+        })).strip()
+        clean = _clean_preserve_tables(raw)
         clean = _enforce_word_limit(clean, target_words)
         logger.info(f"Text section '{req.section_name}' — {len(clean.split())} words")
 
@@ -364,16 +355,24 @@ async def generate_section_content(req: GenerateSectionRequest) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def edit_section(req: EditSectionRequest) -> dict:
-    # Re-detect type for editing context
-    sec_type = detect_section_type(req.doc_type, req.section_name) if hasattr(req, "doc_type") else "text"
+    # M7/M8 FIX: prefer section_type saved at question-gen time over re-detection.
+    # Re-detection reads only the section name, which can mis-classify edited content.
+    sec_type = "text"  # safe default
+    if req.sec_id:
+        qa_row = await get_qa_by_sec_id(req.sec_id)
+        if qa_row:
+            sec_type = qa_row.get("doc_sec_que_ans", {}).get("section_type", "text") or "text"
+    # Fallback: re-detect from doc_type + section_name (original behaviour)
+    if sec_type == "text" and hasattr(req, "doc_type") and req.doc_type:
+        sec_type = detect_section_type(req.doc_type, req.section_name)
 
     chain   = EDIT_PROMPT | get_llm(0.6) | StrOutputParser()
-    raw     = chain.invoke({
+    raw     = (await chain.ainvoke({             # H6 FIX: was chain.invoke (blocking)
         "section_name":     req.section_name,
         "section_type":     sec_type,
         "current_content":  req.current_content,
         "edit_instruction": req.edit_instruction,
-    }).strip()
+    })).strip()
 
     if sec_type == SECTION_TYPE_FLOWCHART:
         updated = _clean_preserve_flowcharts(raw)
@@ -382,7 +381,17 @@ async def edit_section(req: EditSectionRequest) -> dict:
 
     gen_doc = await get_generated_document(req.gen_id)
     if gen_doc:
-        full_doc = gen_doc.get("gen_doc_full", "").replace(req.current_content, updated)
+        full_doc = gen_doc.get("gen_doc_full", "")
+        if req.current_content in full_doc:
+            # M7 FIX: replace only the FIRST occurrence to avoid double-replacing
+            # repeated boilerplate paragraphs that look identical in two sections.
+            full_doc = full_doc.replace(req.current_content, updated, 1)
+        else:
+            logger.warning(
+                "edit_section: current_content not found in gen_doc gen_id=%s — "
+                "content may have been updated by another session. Skipping full_doc update.",
+                req.gen_id,
+            )
         await update_section_content(req.gen_id, gen_doc.get("gen_doc_sec_dec", []), full_doc)
 
     return {
