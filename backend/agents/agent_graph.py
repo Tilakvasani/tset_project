@@ -36,7 +36,6 @@ Redis:
 # ── Standard library ──────────────────────────────────────────────────────────
 import asyncio
 import json
-import logging
 from typing import Any, Optional
 
 # ── Third-party ───────────────────────────────────────────────────────────────
@@ -49,22 +48,21 @@ from langgraph.graph import StateGraph, END, START
 # ── Internal ──────────────────────────────────────────────────────────────────
 from backend.services.redis_service import cache
 
-from backend.rag.system_prompt import build_system_prompt, HISTORY_SUMMARY_PROMPT
+from backend.rag.system_prompt import build_system_prompt
 from backend.core.logger import logger
 from backend.rag.rag_service import (
     _get_llm, tool_search, tool_compare, tool_multi_compare,
-    tool_analysis, tool_refine, tool_full_doc, _save_turn,
+    tool_analysis, tool_refine, tool_full_doc
 )
 from backend.services.notion_service import _headers as _notion_headers, NOTION_API_URL as NOTION_API
 from backend.rag.ticket_dedup import find_duplicate
 from backend.api.agent_routes import _create_notion_ticket, TicketCreateRequest
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-MEMORY_TTL         = 86400
+MEMORY_TTL         = 2_592_000  # 30 days
 MEMORY_KEY         = "docforge:agent:memory:{session_id}"
 HISTORY_KEY        = "docforge:agent:history:{session_id}"
-MAX_HISTORY_TOKENS = 12_000
-MIN_HISTORY_TURNS  = 2
+MIN_HISTORY_TURNS  = 4  # Keep at least last 4 turns raw
 
 
 
@@ -315,7 +313,52 @@ TOOLS = [
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
 
-
+async def _format_history_for_prompt(history: list) -> str:
+    """
+    Sandwich strategy for history:
+    1. First Turn (RAW)
+    2. Middle Turns (Summarized topics)
+    3. Last 4 Turns (RAW)
+    """
+    if not history:
+        return ""
+        
+    # Standardize turns (user + assistant)
+    turns = []
+    i = 0
+    while i < len(history):
+        if i + 1 < len(history) and history[i]["role"] == "user" and history[i+1]["role"] == "assistant":
+            turns.append({"q": history[i]["content"], "a": history[i+1]["content"]})
+            i += 2
+        else:
+            turns.append({"q": history[i]["content"], "a": "..." if history[i]["role"] == "user" else history[i]["content"]})
+            i += 1
+            
+    if len(turns) <= (MIN_HISTORY_TURNS + 1):
+        # Small history? Send all raw
+        return "\n".join(f"User: {t['q']}\nAssistant: {t['a']}" for t in turns)
+        
+    first_turn = turns[0]
+    recent_turns = turns[-MIN_HISTORY_TURNS:]
+    middle_turns = turns[1:-MIN_HISTORY_TURNS]
+    
+    # Summarize middle turns
+    summary_items = []
+    for idx, t in enumerate(middle_turns):
+        q_snippet = t['q'][:100].replace("\n", " ")
+        a_snippet = t['a'][:100].replace("\n", " ")
+        # Turn number: First turn is 1, so middle turns start from 2
+        summary_items.append(f"- Turn {idx+2}: [Question: {q_snippet}...] | [Answer: {a_snippet}...]")
+        
+    summary_block = "Previously discussed topics:\n" + "\n".join(summary_items)
+    
+    formatted = (
+        f"Original Request:\nUser: {first_turn['q']}\nAssistant: {first_turn['a']}\n\n"
+        f"{summary_block}\n\n"
+        f"Recent Context:\n" + 
+        "\n".join(f"User: {t['q']}\nAssistant: {t['a']}" for t in recent_turns)
+    )
+    return formatted
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  STATE
@@ -329,8 +372,9 @@ class AgentState(TypedDict, total=False):
     doc_b:         str
     doc_list:      list[str]
     # Context
-    history:       list
-    memory:        dict
+    history:         list   # Raw message list [{role, content}]
+    history_context: str    # Formatted prompt sandwich (First + Topics + Recent)
+    memory:          dict
     # User identity tracking removed for anonymity
 
     # Router output
@@ -351,82 +395,16 @@ class AgentState(TypedDict, total=False):
 #  REDIS HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _trim_history_by_tokens(history: list) -> list:
-    if not history:
-        return history
-    turns: list = []
-    i = 0
-    while i < len(history):
-        if (i + 1 < len(history)
-                and history[i]["role"] == "user"
-                and history[i + 1]["role"] == "assistant"):
-            turns.append([history[i], history[i + 1]])
-            i += 2
-        else:
-            turns.append([history[i]])
-            i += 1
-    kept: list = []
-    total_chars = 0
-    char_budget = MAX_HISTORY_TOKENS * 4
-    for turn in reversed(turns):
-        turn_chars = sum(len(msg.get("content", "") or "") for msg in turn)
-        if total_chars + turn_chars <= char_budget or len(kept) < MIN_HISTORY_TURNS:
-            kept.insert(0, turn)
-            total_chars += turn_chars
-        else:
-            break
-    flat: list = []
-    for turn in kept:
-        flat.extend(turn)
-    dropped = len(turns) - len(kept)
-    if dropped:
-        logger.info("✂️ [History] Trimmed %d turns (kept %d)", dropped, len(kept))
-    return flat
-
-
 async def _load_history(session_id: str) -> list:
+    """Read the full raw history from Redis."""
     return await cache.get(HISTORY_KEY.format(session_id=session_id)) or []
 
 
-async def _compress_history_if_needed(history: list) -> list:
-    if not history:
-        return history
-    
-    char_budget = MAX_HISTORY_TOKENS * 4
-    total_chars = sum(len(m.get("content", "")) for m in history)
-    
-    if total_chars <= char_budget:
-        return history
-        
-    logger.info("🗜️ [History] Exceeds budget (%d > %d). Compressing...", total_chars, char_budget)
-    
-    # We keep the last MIN_HISTORY_TURNS * 2 messages strictly uncompressed
-    keep_count = MIN_HISTORY_TURNS * 2
-    if len(history) <= keep_count:
-        return _trim_history_by_tokens(history) # fallback to hard trim
-        
-    to_summarize = history[:-keep_count]
-    to_keep      = history[-keep_count:]
-    
-    # Format for summarization
-    summary_text = "\n".join(f"{msg['role'].upper()}: {msg.get('content', '')[:500]}..." for msg in to_summarize)
-    prompt = HISTORY_SUMMARY_PROMPT.format(history=summary_text)
-    
-    llm = _get_llm(temperature=0.0)
-    try:
-        response = await llm.ainvoke(prompt)
-        summary = response.content if hasattr(response, 'content') else str(response)
-        logger.info("🗜️ [History] Compression successful. Kept %d recent messages.", keep_count)
-        return [{"role": "system", "content": f"Prior Conversation Summary:\n{summary}"}] + to_keep
-    except Exception as e:
-        logger.error("Failed to compress history: %e", e)
-        return _trim_history_by_tokens(history)
-
 async def _save_history(session_id: str, history: list):
-    compressed = await _compress_history_if_needed(history)
+    """Save 100% raw history to Redis for 30 days."""
     await cache.set(
         HISTORY_KEY.format(session_id=session_id),
-        compressed,
+        history,
         ttl=MEMORY_TTL,
     )
 
@@ -914,44 +892,36 @@ async def _make_ticket(
 async def node_load_context(state: AgentState) -> AgentState:
     """
     Node 1: Initial context loader.
-    
-    Loads conversation history and user memory from Redis and injects
-    the dynamic system prompt (document-aware) into the message state.
-    
-    Args:
-        state: The current LangGraph agent state.
-        
-    Returns:
-        The updated state with history, memory, and system prompt.
+    Loads raw history and memory, and prepares the 'Sandwich' history prompt.
     """
     session_id = state["session_id"]
-    state["history"] = await _load_history(session_id)
-    state["memory"]  = await _load_memory(session_id)
-
-    # Convert the memory dict into a string for the system prompt
-    memory_str = json.dumps(state["memory"], indent=2) if state["memory"] else "No memory saved yet."
-
-    # Use the dynamic system prompt (now anonymous)
-    system_prompt = await build_system_prompt()
-
-    if memory_str != "No memory saved yet.":
-        system_prompt += f"\n\n════════════════════════════════════════════════════════════════\nMEMORY\n════════════════════════════════════════════════════════════════\n{memory_str}\n"
+    raw_history = await _load_history(session_id)
     
-    # Insert it at the TOP of the history (before user messages)
-    state["history"].insert(0, {"role": "system", "content": system_prompt})
+    state["history"] = raw_history
+    state["memory"]  = await _load_memory(session_id)
+    state["history_context"] = await _format_history_for_prompt(raw_history)
 
     return state
 
 
 async def _exec_chat_summary(history: list, question: str, stream_queue: Any = None) -> str:
-    """Answers meta-questions about the conversation itself."""
+    """
+    Answers meta-questions about the conversation itself.
+    Uses the FULL history for maximum accuracy.
+    """
+    # Clean history (remove system prompts)
     clean_history = [m for m in history if m.get("role") != "system"]
+    
+    # For meta-questions, we provide as much history as possible (up to context limit)
+    # We send the last 100 turns if available.
+    h_block = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in clean_history[-100:])
     
     summary_prompt = (
         "You are CiteRAG's meta-assistant. The user is asking a question about your current conversation history.\n"
         "Use the provided history to answer accurately. If they ask 'how many documents', count the unique document titles mentioned in assistant replies.\n"
+        "If they ask for a specific question number (e.g. 'question 15'), find it in the list below and describe it.\n"
         "Act as an assistant directly answering the user. Do format your response as conversational text, NOT as a function call.\n\n"
-        f"Conversation History:\n{json.dumps(clean_history[-10:], indent=2)}\n\n"
+        f"Conversation History:\n{h_block}\n\n"
         f"Question: {question}"
     )
     
@@ -982,15 +952,22 @@ async def node_route(state: AgentState) -> AgentState:
     """
 
     question = state["question"]
-    history  = state.get("history", [])
     doc_a    = state.get("doc_a", "")
     doc_b    = state.get("doc_b", "")
     doc_list = state.get("doc_list")
-
     # ── Build the final system prompt ─────────────────────────────────
+    memory_str = json.dumps(state.get("memory", {}), indent=2) if state.get("memory") else "No memory saved yet."
     prompt_text = await build_system_prompt()
-    messages    = [{"role": "system", "content": prompt_text}]
-    messages.extend(history)
+    
+    if memory_str != "No memory saved yet.":
+        prompt_text += f"\n\n[USER MEMORY]\n{memory_str}\n"
+    
+    # Inject the SANDWICH history
+    h_context = state.get("history_context", "")
+    if h_context:
+        prompt_text += f"\n\n[CONVERSATION HISTORY]\n{h_context}\n"
+
+    messages = [{"role": "system", "content": prompt_text}]
 
     user_content = question
     if doc_list and len(doc_list) >= 3:
@@ -1295,6 +1272,7 @@ async def run_agent(
         "doc_list":      doc_list,
 
         "history":       [],
+        "history_context": "",
         "memory":        {},
         "tool_name":     "",
         "tool_args":     {},

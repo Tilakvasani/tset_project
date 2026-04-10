@@ -259,7 +259,7 @@ def _run_single_metric(metric, data) -> Optional[float]:
 
             with contextlib.redirect_stdout(io.StringIO()), \
                  contextlib.redirect_stderr(io.StringIO()):
-                result = evaluate(data, metrics=[metric])
+                result = ragas_evaluate(data, metrics=[metric])
 
             df  = result.to_pandas()
             col = df.columns[-1]

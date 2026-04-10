@@ -1,5 +1,5 @@
 """
-DocForge AI — document_utils.py  v2.1
+DocForge AI — document_utils.py 
   1. markdown_to_plain_text()     — strip markdown, preserve table lines + mermaid blocks
   2. DOC_WORD_TARGETS             — industry-standard total word counts
   3. get_words_per_section()      — per-section target words
