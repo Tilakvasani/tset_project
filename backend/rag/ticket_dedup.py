@@ -46,18 +46,20 @@ Below are existing OPEN or IN-PROGRESS support tickets (ID + original question):
 {ticket_list}
 
 New question from user:
-\"{new_question}\"
+"{new_question}"
 
-Task: Decide if the new question is asking about the SAME TOPIC and INTENT as any existing ticket.
-Count as a duplicate even if the words are different, as long as the meaning is the same.
+Task: Decide if the new question is asking about the EXACT SAME TOPIC and INTENT as any existing ticket.
+Only count as a duplicate if the user is asking about the same specific entity (person, policy, document, or comparison).
 
 Examples of DUPLICATES:
 - "who is raju" vs "tell me about raju"         → same person lookup
 - "what is notice period" vs "how long is notice period" → same policy question
 
 Examples of NOT DUPLICATES:
+- "who is raju" vs "who is ramesh"            → DIFFERENT people
+- "is NDA mandatory" vs "is SOW mandatory"    → DIFFERENT documents
+- "salary structure" vs "notice period"          → DIFFERENT HR topics
 - "who is raju" vs "what is leave policy"        → completely different topics
-- "salary structure" vs "notice period"          → different HR topics
 
 Reply in EXACTLY this format, nothing else:
 DUPLICATE: YES
@@ -118,7 +120,12 @@ async def _fetch_open_tickets() -> list[dict]:
             if not question:
                 continue
 
-            ticket_id = page["id"].replace("-", "")[:8].upper()
+            # Get numeric Ticket ID if available, else fallback to Page ID snippet
+            id_prop = props.get("Ticket ID", {})
+            id_items = id_prop.get("rich_text", []) or id_prop.get("title", [])
+            manual_id = "".join(t.get("plain_text", "") for t in id_items).strip()
+
+            ticket_id = manual_id if manual_id else page["id"].replace("-", "")[:8].upper()
             tickets.append({
                 "ticket_id": ticket_id,
                 "page_id":   page["id"],

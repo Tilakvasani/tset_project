@@ -188,21 +188,6 @@ GAP IDENTIFIED:
 SUMMARY: [2 sentences max. Main finding and recommended action.]"""
 
 
-HYDE_PROMPT = """\
-Write a brief factual description (2-4 sentences) as if it were a passage from a
-corporate HR policy, legal contract, or finance document at a software company.
-
-Topic: {question}
-
-Include where relevant:
-- Specific numbers, durations, percentages, or conditions
-- Policy names, clause names, or document section titles
-- Employee roles, departments, or hierarchy levels
-- Turabit-specific HR terms: notice period, probation, appraisal, reimbursement,
-  leave entitlement, carry-forward, salary structure, working hours, overtime,
-  resignation, contract terms, confidentiality, non-disclosure, indemnity
-
-Return ONLY the description. No preamble, no filler, no bullet points."""
 
 
 SUMMARY_PROMPT = """\
@@ -310,18 +295,6 @@ For EACH finding, use this structure:
 [2-3 sentences. How serious overall? What is the single priority action?]
 
 Analysis:"""
-
-
-EXPAND_PROMPT = """\
-Generate 4 alternative search queries for the following question.
-Use different vocabulary and phrasing in each — the goal is to find the same
-information using different words that might appear in corporate documents.
-Include at least one simpler or more informal phrasing (e.g. how a user might
-type it casually, or a Hinglish/transliterated version if the question involves
-HR or policy topics common in Indian companies).
-Return ONLY the 4 queries, one per line. No numbering, no explanation.
-
-Question: {question}"""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -677,79 +650,10 @@ def _confidence(chunks: list, answer: str = "") -> str:
     return "low"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SELF-VERIFY + RERANK  (Phase 1 & 2 accuracy improvements)
-# ══════════════════════════════════════════════════════════════════════════════
-
-VERIFY_PROMPT = """\
-Question: {question}
-Answer: {answer}
-
-Does this answer directly address the question using specific facts?
-Reply ONLY: GOOD, PARTIAL, or BAD
-- GOOD: Answer has specific facts that address the question
-- PARTIAL: Answer is related but missing key details
-- BAD: Answer is vague, generic, or doesn't address the question"""
-
-RERANK_PROMPT = """\
-Question: {question}
-
-Rank these passages by relevance to the question (most relevant first).
-Return ONLY the numbers in order, comma-separated. Example: 3,1,2
-
-{passages}"""
 
 
-async def _self_verify(question: str, answer: str) -> str:
-    """Quick LLM self-check (~0.5s). Returns GOOD/PARTIAL/BAD."""
-    try:
-        resp = await _get_llm().ainvoke(
-            VERIFY_PROMPT.format(question=question, answer=answer)
-        )
-        verdict = resp.content.strip().upper().split()[0]
-        if verdict in ("GOOD", "PARTIAL", "BAD"):
-            return verdict
-    except Exception:
-        pass
-    return "GOOD"  # fail-open
 
 
-async def _rerank(question: str, chunks: list, top_n: int = 8) -> list:
-    """LLM-based reranking of retrieved chunks. Always-on."""
-    if len(chunks) <= 3:
-        return chunks
-    passages = "\n\n".join(
-        f"[{i+1}] {c['content'][:200]}" for i, c in enumerate(chunks[:12])
-    )
-    try:
-        resp = await _get_llm().ainvoke(
-            RERANK_PROMPT.format(question=question, passages=passages)
-        )
-        order = [int(x.strip()) - 1 for x in resp.content.strip().split(",")]
-        reranked = [chunks[i] for i in order if 0 <= i < len(chunks)]
-        return reranked[:top_n] if reranked else chunks[:top_n]
-    except Exception:
-        return chunks[:top_n]
-
-
-async def _hyde_retry(question, filters, history, stream_queue=None):
-    """HyDE-based retry: generate hypothetical answer, re-retrieve, re-answer."""
-    hyp_resp = await _get_llm().ainvoke(HYDE_PROMPT.format(question=question))
-    hyp = hyp_resp.content.strip()
-    new_chunks = await _retrieve(hyp, filters, top_k=10)
-    new_context = _build_context(new_chunks)
-    prompt_str = ANSWER_PROMPT.format(history=history, context=new_context, question=question)
-
-    if stream_queue:
-        answer_chunks = []
-        async for chunk in _get_llm().astream(prompt_str):
-            if chunk.content:
-                answer_chunks.append(chunk.content)
-                await stream_queue.put({"type": "token", "content": chunk.content})
-        return "".join(answer_chunks).strip(), new_chunks
-    else:
-        resp = await _get_llm().ainvoke(prompt_str)
-        return resp.content.strip(), new_chunks
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -786,34 +690,10 @@ async def tool_search(question: str, filters: dict,
     chunks = await _retrieve(question, filters, top_k)
 
 
-    # ── Rerank chunks for better context ────────────────────────────────────────
-    chunks = await _rerank(question, chunks)
 
     # ── Build context + fetch history in parallel ─────────────────────────────
     context = _build_context(chunks)
     history = await _get_history(session_id)
-
-    # ── Early not-found guard WITH SELF-HEALING ────────────────────────────────
-    quality_chunks = [c for c in chunks if c.get("score", 0) >= MIN_SCORE]
-    if not quality_chunks:
-        logger.info("🔄 First-pass empty → triggering HyDE Self-Healing for: %s", question[:60])
-        answer, chunks = await _hyde_retry(question, filters, history, stream_queue)
-        if "could not find" in answer.lower():
-            # Truly not found even after HyDE
-            not_found_answer = "I could not find information about this in the available documents."
-            result = {
-                "answer":     not_found_answer,
-                "citations":  [],
-                "chunks":     [],
-                "tool_used":  "search",
-                "confidence": "low",
-            }
-            await cache.set(a_key, result, ttl=600)
-            return result
-        # If HyDE found something, we continue to the rest of the logic
-    
-    # Re-check quality chunks after potential HyDE
-    quality_chunks = [c for c in chunks if c.get("score", 0) >= MIN_SCORE]
 
     # ── LLM generates the answer from retrieved context ───────────────────────
     prompt_str = ANSWER_PROMPT.format(history=history, context=context, question=question)
@@ -829,12 +709,6 @@ async def tool_search(question: str, filters: dict,
         response = await _get_llm().ainvoke(prompt_str)
         answer = response.content.strip()
 
-    # ── Self-verify: catch bad answers before returning ────────────────────────
-    verdict = await _self_verify(question, answer)
-    if verdict in ("BAD", "PARTIAL") and quality_chunks:
-        logger.info("🔄 Self-verify=%s → retrying with HyDE for: %s", verdict, question[:60])
-        answer, chunks = await _hyde_retry(question, filters, history, stream_queue)
-
     not_found = "could not find" in answer.lower()
 
     result = {
@@ -845,9 +719,11 @@ async def tool_search(question: str, filters: dict,
         "confidence": "low" if not_found else _confidence(chunks, answer),
     }
 
-    ttl = 600 if not_found else TTL_ANSWER
-    await cache.set(a_key, result, ttl=ttl)
-    logger.info("💾 [Cache SET] answer for %r (ttl=%ds)", question[:60], ttl)
+    if not not_found:
+        await cache.set(a_key, result, ttl=TTL_ANSWER)
+        logger.info("💾 [Cache SET] answer for %r (ttl=%ds)", question[:60], TTL_ANSWER)
+    else:
+        logger.info("ℹ️ [Cache SKIP] No info found for %r", question[:60])
 
     return result
 
@@ -887,31 +763,11 @@ async def tool_full_doc(question: str, filters: dict,
         response = await _get_llm().ainvoke(prompt)
         answer   = response.content.strip()
 
-    # ── Self-verify ───────────────────────────────────────────────────────────
-    verdict = await _self_verify(question, answer)
-    if verdict == "BAD" and chunks:
-        logger.info("🔄 Full-doc self-verify=BAD → retrying with HyDE")
-        answer, chunks = await _hyde_retry(question, filters, history, stream_queue)
-
-    not_found = "could not find" in answer.lower()
-    return {
-        "answer":     answer,
-        "citations":  _citations(chunks),
-        "chunks":     chunks,
-        "tool_used":  "full_doc",
-        "confidence": "low" if not_found else _confidence(chunks, answer),
-    }
-
-
 async def tool_refine(question: str, filters: dict,
                       session_id: str, top_k: int = 15, stream_queue: asyncio.Queue = None) -> dict:
-    """HyDE for summaries — generate hypothetical answer first for better retrieval."""
-    # Fixed: use async instead of blocking run_in_executor
-    hyp_resp = await _get_llm().ainvoke(HYDE_PROMPT.format(question=question))
-    hyp = hyp_resp.content.strip()
     history = await _get_history(session_id)
 
-    chunks  = await _retrieve(hyp, filters, top_k)
+    chunks  = await _retrieve(question, filters, top_k)
     context = _build_context(chunks)
     prompt_str = SUMMARY_PROMPT.format(context=context, question=question)
     if stream_queue:
@@ -1272,11 +1128,6 @@ async def tool_analysis(question: str, filters: dict,
         response = await _get_llm().ainvoke(prompt_str)
         answer = response.content.strip()
 
-    # ── Self-verify ───────────────────────────────────────────────────────────
-    verdict = await _self_verify(question, answer)
-    if verdict == "BAD" and chunks:
-        logger.info("🔄 Analysis self-verify=BAD → retrying with HyDE")
-        answer, chunks = await _hyde_retry(question, {}, history, stream_queue)
 
     return {
         "answer":     answer,

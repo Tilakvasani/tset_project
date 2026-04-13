@@ -223,9 +223,9 @@ async def api_ask(req: AskRequest):
                     return
 
                 tool_used = result.get("tool_used", "chat")
-                logger.info("✅ [%s] Done | tool=%s", request_id, tool_used)
+                info_found = "could not find" not in result.get("answer", "").lower()
 
-                if tool_used in _SAFE_TOOLS:  # M2: use module-level constant
+                if tool_used in _SAFE_TOOLS and info_found:
                     await cache.set(a_key, result, ttl=3600)
 
                 yield json.dumps({"type": "done", "result": result}) + "\n"
@@ -248,7 +248,8 @@ async def api_ask(req: AskRequest):
         # NOTE: Do NOT re-define _SAFE_TOOLS as a local variable here — doing so
         # would poison the streaming_generator closure and cause a NameError.
         tool_used = result.get("tool_used", "chat")
-        if tool_used in _SAFE_TOOLS:
+        info_found = "could not find" not in result.get("answer", "").lower()
+        if tool_used in _SAFE_TOOLS and info_found:
             await cache.set(a_key, result, ttl=3600)
         
         return result
