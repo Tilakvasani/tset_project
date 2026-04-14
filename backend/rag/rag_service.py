@@ -369,14 +369,21 @@ async def _get_history(session_id: str) -> str:
 async def _save_turn(session_id: str, q: str, a: str):
     """
     Write a turn to the SAME key the agent uses (OpenAI message format).
-    This keeps tools and the agent in the same conversation store.
+    TTL is set to 30 days (2,592,000s) to match the main agent memory.
+    Includes a lightweight deduplication check.
     """
     AGENT_HISTORY_KEY = "docforge:agent:history:{session_id}"
     key  = AGENT_HISTORY_KEY.format(session_id=session_id)
     data = await cache.get(key) or []
+    
+    # Simple deduplication: if last user msg is same as 'q', don't append again
+    if len(data) >= 2 and data[-2].get("role") == "user" and data[-2].get("content") == q:
+        return
+
     data.append({"role": "user",      "content": q})
     data.append({"role": "assistant", "content": a})
-    await cache.set(key, data[-40:], ttl=TTL_SESSION)   # keep last 20 turns
+    # Save with 30-day TTL (2,592,000 seconds)
+    await cache.set(key, data[-40:], ttl=2592000)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -503,35 +510,7 @@ async def _retrieve(query: str, filters: dict, top_k: int = 8) -> list:
                 seen_ids.add(uid)
                 all_chunks.insert(0, c)  # Insert at front for priority
 
-    # Step 2: expand query with synonyms (only if original returns < 5 results)
-    if len(all_chunks) < 5:
-        try:
-            # Fixed: use async instead of blocking sync .invoke()
-            expand_resp = await _get_llm().ainvoke(
-                EXPAND_PROMPT.format(question=query)
-            )
-            expanded = expand_resp.content.strip()
-            variants = [v.strip() for v in expanded.splitlines() if v.strip()][:4]
-            logger.info("🌿 [Expand] Query expanded to: %s", variants)
-
-            seen_ids = {c["notion_page_id"] + c["heading"] for c in all_chunks}
-            # PERF: run variant retrievals in parallel
-            variant_results = await asyncio.gather(
-                *[_retrieve_single(v, filters, 4, embedder, collection) for v in variants],
-                return_exceptions=True,
-            )
-            for extras in variant_results:
-                if isinstance(extras, Exception):
-                    continue
-                for c in extras:
-                    uid = c["notion_page_id"] + c["heading"]
-                    if uid not in seen_ids:
-                        seen_ids.add(uid)
-                        all_chunks.append(c)
-        except Exception as e:
-            logger.warning("⚠️ [Expand] Failed: %s", e)
-
-    # Step 3: deduplicate and sort by score
+    # Step 2: deduplicate and return (Simplified for maximum speed)
     seen, final = set(), []
     for c in sorted(all_chunks, key=lambda x: x["score"], reverse=True):
         uid = c["notion_page_id"] + c["heading"]
@@ -540,69 +519,6 @@ async def _retrieve(query: str, filters: dict, top_k: int = 8) -> list:
             final.append(c)
 
     final = final[:top_k]
-
-    # Diversity check — trigger if ANY single doc contributes > 50% of chunks
-    if final:
-        doc_counts = {}
-        for c in final:
-            doc_counts[c["doc_title"]] = doc_counts.get(c["doc_title"], 0) + 1
-        dominant_doc = max(doc_counts, key=doc_counts.get)
-        dominant_pct = doc_counts[dominant_doc] / len(final)
-
-        if dominant_pct > 0.5:
-            unique_titles = {c["doc_title"] for c in final}
-            logger.info("🔍 [Retrieve] Low diversity: '%s' = %.0f%% of chunks. Expanding...",
-                        dominant_doc, dominant_pct * 100)
-            diverse_queries = [
-                f"{query} employee handbook policy",
-                f"{query} employment contract terms",
-                f"{query} vendor agreement conditions",
-                f"{query} HR policy procedure",
-            ]
-            seen = {c["notion_page_id"] + c["heading"] for c in final}
-            # PERF: run diversity queries in parallel
-            diverse_results = await asyncio.gather(
-                *[_retrieve_single(dq, {}, 3, embedder, collection) for dq in diverse_queries],
-                return_exceptions=True,
-            )
-            for extras in diverse_results:
-                if isinstance(extras, Exception):
-                    continue
-                for c in extras:
-                    uid = c["notion_page_id"] + c["heading"]
-                    if uid not in seen and c["doc_title"] != dominant_doc:
-                        seen.add(uid)
-                        unique_titles.add(c["doc_title"])
-                        final.append(c)
-            final = sorted(final, key=lambda x: x["score"], reverse=True)[:top_k]
-            logger.info("⚖️ [Retrieve] After diversity filter: %d chunks from %d docs",
-                        len(final), len({c["doc_title"] for c in final}))
-
-    # Table recovery — if chunks reference a table/schedule, fetch the table chunk too
-    _table_ref_phrases = [
-        "as per the table", "refer to the table", "table below",
-        "outlined below", "as follows", "see the table", "per the schedule",
-        "listed below", "as detailed below", "entitlement table",
-        "schedule below", "the following table",
-    ]
-    _table_refs_found = any(
-        phrase in c["content"].lower()
-        for c in final
-        for phrase in _table_ref_phrases
-    )
-    if _table_refs_found:
-        logger.info("📊 [Retrieve] Table reference detected — running targeted table recovery")
-        _recovery_q = f"{query} table entitlement schedule days carry forward list"
-        seen_ids = {c["notion_page_id"] + c["heading"] for c in final}
-        extra = await _retrieve_single(_recovery_q, filters, 5, embedder, collection)
-        for c in extra:
-            uid = c["notion_page_id"] + c["heading"]
-            if uid not in seen_ids:
-                seen_ids.add(uid)
-                final.append(c)
-        final = sorted(final, key=lambda x: x["score"], reverse=True)[:top_k + 3]
-        logger.info("📊 [Retrieve] After table recovery: %d chunks", len(final))
-
     logger.info("✅ [Retrieve] Final: %d chunks found for %r", len(final), query[:80])
 
     # Cache the retrieval result

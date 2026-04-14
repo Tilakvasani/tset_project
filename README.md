@@ -42,30 +42,25 @@ A second major subsystem — **CiteRAG** — is a tool-calling conversational RA
 ## Features
 
 ### Document Generation
-- AI-powered generation via Azure OpenAI (GPT-4.1 Mini)
-- 100 document types — NDA, Privacy Policy, SLA, Employment Contract, and more
-- Multi-department support — HR, Finance, Legal, Sales, IT, Operations, and more
-- One-click Notion publishing with full metadata (title, type, department, version, word count)
-- Automatic version control — same Department + Doc Type increments automatically
-- Redis caching for fast repeated generation and deduplication
-- Mermaid flowchart rendering → PNG → Imgur → Notion image blocks
-- DOCX export via `docx_builder.py`
-- Modern dark UI built with Streamlit
-- Docker-ready with `docker-compose.yml`
+- **🧠 Advanced Intelligence**: Powered by Azure OpenAI (GPT-4o Mini)
+- **🚀 Ultra-Fast RAG**: Optimized for sub-second vector retrieval and response generation
+- **📄 100 Document Types**: NDA, Privacy Policy, SLA, Employment Contract, and more
+- **🏢 Multi-Department**: HR, Finance, Legal, Sales, IT, Operations, and more
+- **📝 Notion Sync**: One-click publishing with auto-versioning and full metadata tracking
+- **📈 Version Control**: Persistent Notion-based version history per Department/DocType
+- **📊 Dynamic Flowcharts**: Automatic Mermaid rendering to Notion image blocks
+- **💾 Redis Optimized**: High-speed caching for generation, retrieval, and session memory
 
 ### CiteRAG Agent
-- **🧠 Agentic Memory**: Persistent cross-session user profiles (Redis-backed) for personalized interactions
-- **⚡ Smart Delta-Sync**: Notion ingestion skips unchanged documents via `last_edited_time` tracking
-- **🛡️ Self-Healing RAG**: Auto-retries with HyDE generation on low-confidence or partial answers
-- **🌐 Global Retrieval**: Native support for Hindi, Hinglish, Marathi, and Gujarati queries
-- **🤖 LLM-First Architecture**: All tool selection, security, priority, and intent routing done exclusively by the main LLM — zero hardcoded keyword Lists
-- **🔒 3-Layer Security**: Azure Content Filter → LLM System Prompt → Cache guard
-- Conversational Q&A over ingested Notion documents with full chat history
-- Understands contextual references ("the first one", "both of them")
-- Auto-creates support tickets in Notion when answer confidence is low
-- Ticket lifecycle management — create, update status, bulk-update — via natural language
-- LLM-based duplicate ticket detection before creating new tickets
-- RAGAS evaluation for answer quality scoring
+- **🧠 Agentic Memory**: Unified 30-day persistent history (Redis-backed) synchronized across cache hits and agent turns.
+- **⚡ High-Performance RAG**: Optimized "Direct-Shot" retrieval pipeline (Vector Search → LLM) for minimum latency; no speculative background cycles.
+- **🖱️ Scroll-Stable UI**: Callback-driven interaction (Streamlit `on_click`) ensures smooth navigation without "jumping" to page top.
+- **💎 Premium UX**: Beautiful dark-mode interface with micro-animations, glassmorphism, and dynamic follow-up suggestions.
+- **🛡️ 3-Layer Security**: Azure Content Filter → LLM System Guard → Action-Specific Cache Guard.
+- **🌐 Global Retrieval**: Native support for Hindi, Hinglish, Marathi, and Gujarati queries.
+- **🤖 LLM-First Architecture**: All tool selection, security, and intent routing handled by GPT-4o-mini — zero hardcoded keyword lists.
+- **🎫 Ticket Lifecycle**: Auto-creates Notion support tickets for low-confidence answers; full ticket management via natural language.
+- **🔍 Smart Deduplication**: LLM-based duplicate ticket detection before creating new Notion entries.
 
 ---
 
@@ -75,46 +70,44 @@ A second major subsystem — **CiteRAG** — is a tool-calling conversational RA
 docForge_AI-main/
 ├── backend/
 │   ├── agents/
-│   │   └── agent_graph.py          # Tool-calling agent: LLM loop, tool executors, Redis history
+│   │   └── agent_graph.py          # Tool-calling architecture & intent routing
 │   ├── api/
 │   │   ├── routes.py               # Core document generation endpoints
-│   │   ├── agent_routes.py         # Ticket CRUD + Notion REST helpers
-│   │   └── rag_routes.py           # /ask, /ingest, /status, /eval, /cache
+│   │   ├── agent_routes.py         # Support ticket & Notion REST utilities
+│   │   └── rag_routes.py           # Conversational RAG (/ask, /ingest) endpoints
 │   ├── core/
-│   │   ├── config.py               # Settings & .env loading
-│   │   └── logger.py               # Logging setup
+│   │   ├── config.py               # Global settings & environment loading
+│   │   ├── llm.py                  # Azure OpenAI client initialization
+│   │   └── logger.py               # Structured logging configuration
 │   ├── models/
-│   │   └── document_model.py       # Document dataclass
+│   │   └── document_model.py       # Core document data entities
 │   ├── prompts/
-│   │   ├── prompts.py              # Prompt templates per doc type
-│   │   └── quality_gates.py        # Output quality validation
+│   │   ├── prompts.py              # Specialized templates for 100+ document types
+│   │   └── quality_gates.py        # Multi-stage output validation logic
 │   ├── rag/
-│   │   ├── rag_service.py          # Core RAG: vector retrieval + answer generation
-│   │   ├── ingest_service.py       # Notion → ChromaDB ingest pipeline
-│   │   ├── ragas_scorer.py         # RAGAS evaluation scoring
-│   │   ├── ticket_dedup.py         # LLM-based duplicate ticket detection
-│   │   └── system_prompt.py        # RAG system prompt
+│   │   ├── ingest_service.py       # Optimized Notion-to-ChromaDB sync engine
+│   │   ├── rag_service.py          # High-speed retrieval & answer generation 
+│   │   ├── ragas_scorer.py         # Automated RAG evaluation & scoring
+│   │   ├── system_prompt.py        # CiteRAG agent system instructions
+│   │   └── ticket_dedup.py         # Semantic duplicate ticket detection
 │   ├── schemas/
-│   │   ├── document_schema.py      # Request/response Pydantic schemas
-│   │   └── notion_schema.py        # Notion publish schema
+│   │   ├── document_schema.py      # Pydantic models for document requests
+│   │   └── notion_schema.py        # Mapping schemas for Notion properties
 │   ├── services/
-│   │   ├── generator.py            # Azure OpenAI generation logic
-│   │   ├── notion_service.py       # Notion API + version control
-│   │   ├── redis_service.py        # Redis caching layer
-│   │   ├── document_utils.py       # Document utility helpers
-│   │   └── db_service.py           # Database service
-│   └── main.py                     # FastAPI app entry point
+│   │   ├── db_service.py           # Persistent document storage logic
+│   │   ├── document_utils.py       # Content formatting & metadata helpers
+│   │   ├── generator.py            # Azure GPT-4o Mini generation service
+│   │   ├── notion_service.py       # Notion API wrapper & version control logic
+│   │   └── redis_service.py        # Unified caching & 30-day session store
+│   └── main.py                     # FastAPI application entry point
 ├── ui/
-│   └── streamlit_app.py            # Streamlit frontend
-├── all_document/                   # Sample documents by department
-├── chroma_db/                      # ChromaDB vector store
-├── docx_builder.py                 # DOCX export helper
-├── flowchart_renderer.py           # Mermaid → PNG renderer
-├── docker-compose.yml
-├── Dockerfile.backend
-├── Dockerfile.frontend
-├── requirements.txt
-└── .env.example
+│   └── streamlit_app.py            # Callback-driven Streamlit frontend
+├── chroma_db/                      # Local vector database storage
+├── docx_builder.py                 # Word (DOCX) export engine
+├── flowchart_renderer.py           # Mermaid → PNG rendering service
+├── docker-compose.yml              # Multi-container orchestration
+├── requirements.txt                # Python dependencies
+└── .env.example                    # Template for environment configuration
 ```
 
 ---
@@ -215,7 +208,7 @@ AZURE_LLM_API_VERSION=2024-12-01-preview
 AZURE_OPENAI_EMB_KEY=...
 AZURE_EMB_ENDPOINT=https://your-resource.openai.azure.com/
 AZURE_EMB_DEPLOYMENT=text-embedding-3-large
-AZURE_EMB_API_VERSION=2023-05-15
+AZURE_EMB_API_VERSION=2024-02-01
 
 # Optional
 IMGUR_CLIENT_ID=...              # Enables flowchart image rendering
@@ -359,13 +352,13 @@ Set `IMGUR_CLIENT_ID` in `.env` to enable image rendering. Without it, flowchart
 
 ## Redis Caching
 
-| Cache Key | What's Cached | Invalidated When |
-|-----------|---------------|-----------------|
-| `departments` | All department list | Never (stable) |
-| `sections:{doc_type}` | Sections for a doc type | Never (stable) |
-| `questions:{sec_id}` | Generated questions | Never per session |
-| `section_content:{sec_id}` | LLM-generated section text | On answer save or section edit |
-| `notion_library` | All published Notion docs | On new document publish (5-min TTL) |
+| Cache Key | What's Cached | Default TTL |
+|-----------|---------------|-------------|
+| `docforge:agent:history:{id}`| Chat History (OpenAI format) | 30 Days |
+| `answer:{hash}` | Final RAG answers | 1 Hour |
+| `departments` | List of departments | 1 Hour |
+| `sections:{type}` | Sections for a doc type | 1 Hour |
+| `notion_library` | Published document list | 5 Minutes |
 
 ---
 
@@ -450,34 +443,27 @@ User Message
 🤖 MAIN LLM  —  node_route()   [ALL decisions made here]
     │
     ├── block_off_topic   ← Security, injection, off-topic, greetings
-    ├── search            ← Single document Q&A
+    ├── search            ← High-speed direct vector search
     ├── summarize         ← Document summarisation
     ├── full_doc          ← Full document retrieval
-    ├── compare           ← 2-document comparison
-    ├── multi_compare     ← 3+ document comparison
-    ├── analyze           ← Deep legal/contract analysis
-    ├── multi_query       ← Multi-part question splitting
-    ├── create_ticket     ← Support ticket creation
-    ├── select_ticket     ← Pick a specific ticket from list
-    ├── create_all_tickets← Bulk ticket creation
-    └── update_ticket     ← Ticket status update
+    ├── compare           ← Side-by-side analysis
+    ├── analyze           ← Deep legal/policy audit
+    └── create_ticket     ← Notion support ticket flow
     │
     ▼
 [agent_graph.py]  —  node_execute_tool()
-    • Executes selected tool via rag_service.py / notion_service
-    • Azure Content Filter block → 🚨 [Security] log + clean refusal
+    • Executes tool via rag_service.py or notion_service
+    • 🚨 Security block returns clean refusal if detected
     │
     ▼
 [agent_graph.py]  —  node_save_history()
-    • Save turn to Redis
-    • Track unanswered questions (confidence=low)
-    • Update user interest profile
+    • Save turn to Redis with 30-day TTL
+    • Updates user context for personalized answers
     │
     ▼
 [streamlit_app.py]  —  UI
-    • Stream tokens to user
-    • Security errors → clean bold text alert
-    • Citations, confidence badge, tool label
+    • tokens streamed to user via callback interaction
+    • Zero scroll-jump design for fluid chat experience
 ```
 
 ### Security Architecture
@@ -573,16 +559,16 @@ curl -X POST http://localhost:8000/api/rag/ingest \
 
 | Layer | Technology |
 |-------|-----------|
-| AI Generation | Azure OpenAI GPT-4.1 Mini |
+| AI Generation | Azure OpenAI GPT-4o Mini |
 | Embeddings | Azure OpenAI text-embedding-3-large |
-| Vector Store | ChromaDB |
+| Vector Store | ChromaDB (Local/Ephemeral) |
 | Backend | FastAPI + Python 3.11 |
-| Frontend | Streamlit |
+| Frontend | Streamlit (Dark Mode) |
 | Document Store | Notion API |
-| Caching / History | Redis |
+| Caching | Redis |
+| History | Redis (30-Day Persistence) |
 | Flowcharts | Mermaid → Imgur → Notion |
-| Containerization | Docker + Docker Compose |
-| DOCX Export | python-docx via `docx_builder.py` |
+| DOCX Export | python-docx |
 
 ---
 
