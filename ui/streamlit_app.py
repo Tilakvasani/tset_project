@@ -1253,8 +1253,9 @@ elif active_tab == "generate":
                                    use_container_width=True)
 
         st.divider()
-        with st.expander("📄 Preview Full Document"):
-            st.text(full_doc)
+        with st.expander("📄 Preview Full Document", expanded=True):
+            with st.container(border=True):
+                st.markdown(full_doc)
         st.write("")
         if st.button("➕ Create Another Document", type="primary", use_container_width=True):
             saved_ctx   = st.session_state.company_ctx
