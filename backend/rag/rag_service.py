@@ -658,6 +658,15 @@ async def tool_full_doc(question: str, filters: dict,
         response = await _get_llm().ainvoke(prompt)
         answer   = response.content.strip()
 
+    not_found = "could not find" in answer.lower()
+    return {
+        "answer":     answer,
+        "citations":  _citations(chunks),
+        "chunks":     chunks,
+        "tool_used":  "full_doc",
+        "confidence": "low" if not_found else _confidence(chunks, answer),
+    }
+
 async def tool_refine(question: str, filters: dict,
                       session_id: str, top_k: int = 15, stream_queue: asyncio.Queue = None) -> dict:
     history = await _get_history(session_id)
