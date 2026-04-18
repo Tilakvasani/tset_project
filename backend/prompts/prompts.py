@@ -817,4 +817,3 @@ OUTPUT RULES based on section type:
 Apply the edit instruction to the content above and return ONLY the updated content.
 Do not add explanations, preambles, or notes about what changed."""
 )
-

@@ -20,13 +20,13 @@ import asyncio
 import datetime
 import re
 import uuid
-from typing import Dict
+from typing import Dict, List, Optional
 
 # ── Third-party ───────────────────────────────────────────────────────────────
 import json
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # ── Internal ──────────────────────────────────────────────────────────────────
 from backend.core.logger import logger
@@ -39,8 +39,6 @@ from backend.agents.agent_graph import run_agent
 router = APIRouter(prefix="/rag", tags=["RAG"])
 
 
-from typing import Dict, List, Optional
-from pydantic import BaseModel, Field
 
 # M2 FIX: Single definition of safe (idempotent) tools — only these are cached.
 _SAFE_TOOLS = frozenset({"search", "compare", "multi_compare", "multi_query", "full_doc", "analysis", "refine"})
@@ -164,8 +162,17 @@ async def api_ask(req: AskRequest):
             }
         raise
 
-    logger.info("🚀 [%s] /ask | session=%s | q=%r", 
-                request_id, req.session_id, question[:500])
+    logger.info(
+        "📥 [%s] /ask RECEIVED | session=%s | stream=%s | top_k=%d | skip_cache=%s",
+        request_id, req.session_id, req.stream, req.top_k, req.skip_cache,
+    )
+    logger.info("   ↳ User question: %r", question)
+    if req.filters:
+        logger.info("   ↳ Filters: %s", req.filters)
+    if req.doc_a or req.doc_b:
+        logger.info("   ↳ Compare docs: %r vs %r", req.doc_a, req.doc_b)
+    if req.doc_list:
+        logger.info("   ↳ Multi-compare docs: %s", req.doc_list)
 
     try:
         # ── Cache Check ───────────────────────────────────────────────────────

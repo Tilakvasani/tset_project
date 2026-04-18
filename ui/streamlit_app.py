@@ -15,6 +15,7 @@ Changes vs v14:
 
 import sys
 import os
+import logging
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -26,6 +27,14 @@ import streamlit as st
 import streamlit.components.v1 as _components
 import httpx
 import requests
+
+# ── Frontend logger (logs appear in the Streamlit terminal) ──────────────────
+_log = logging.getLogger("docforge.frontend")
+if not _log.handlers:
+    _h = logging.StreamHandler(sys.stdout)
+    _h.setFormatter(logging.Formatter("  %(asctime)s  🖥️  [frontend]  %(message)s", datefmt="%H:%M:%S"))
+    _log.addHandler(_h)
+_log.setLevel(logging.DEBUG)
 
 try:
     from docx_builder import build_docx
@@ -107,30 +116,38 @@ def _render_ragas_scores(scores: dict, title: str = "", timestamp: str = ""):
 # ── API helpers ───────────────────────────────────────────────────────────────
 
 def api_get(ep: str) -> dict | None:
+    _log.info("→ GET  %s%s", API_URL, ep)
     try:
         r = httpx.get(f"{API_URL}{ep}", timeout=30)
         r.raise_for_status()
+        _log.info("← 200  GET  %-40s  (%d bytes)", ep, len(r.content))
         return r.json()
     except httpx.HTTPStatusError as e:
+        _log.error("← %s  GET  %s  — %s", e.response.status_code, ep, e.response.text[:200])
         st.error(f"API {e.response.status_code}: {e.response.text[:200]}")
     except Exception as e:
+        _log.error("← ERR  GET  %s  — %s", ep, e)
         st.error(f"Connection error: {e}")
     return None
 
 
 def api_post(ep: str, data: dict, timeout: int = 120) -> dict | None:
+    _log.info("→ POST %s%s  keys=%s  timeout=%ds", API_URL, ep, list(data.keys()), timeout)
     try:
         r = httpx.post(f"{API_URL}{ep}", json=data, timeout=timeout)
         r.raise_for_status()
+        _log.info("← 200  POST %-40s  (%d bytes)", ep, len(r.content))
         return r.json()
     except httpx.HTTPStatusError as e:
         try:
             msg = e.response.json().get("detail", e.response.text[:200])
         except Exception:
             msg = e.response.text[:200]
+        _log.error("← %s  POST %s  — %s", e.response.status_code, ep, msg)
         st.session_state._last_api_error = msg
         return None
     except Exception as e:
+        _log.error("← ERR  POST %s  — %s", ep, e)
         st.session_state._last_api_error = f"Connection error: {e}"
         return None
 
@@ -207,6 +224,7 @@ with st.sidebar:
             _cn = _uuid.uuid4().hex[:8]
             st.session_state.rag_chats[_cn] = {"title": "New chat", "messages": [], "created": _time_mod.time()}
             st.session_state.rag_active_chat = _cn
+            _log.info("[CiteRAG] New chat created id=%s", _cn)
             st.rerun()
 
         st.caption("Recent")
@@ -244,6 +262,7 @@ with st.sidebar:
                             st.rerun()
                     with _b:
                         if st.button("🗑 Delete", key=f"del_{_cid}", use_container_width=True, type="primary"):
+                            _log.info("[CiteRAG] Chat deleted id=%s msgs=%d", _cid, len(_chat["messages"]))
                             del st.session_state.rag_chats[_cid]
                             if st.session_state.rag_active_chat == _cid:
                                 st.session_state.rag_active_chat = (
@@ -366,6 +385,7 @@ if active_tab == "ask":
 
     if user_q or _prefill:
         question = (user_q or _prefill).strip()
+        _log.info("💬 [CiteRAG] User submitted question | session=%s | q=%r", active_id, question)
         if not messages:
             st.session_state.rag_chats[active_id]["title"] = question[:40] + ("..." if len(question) > 40 else "")
         st.session_state.rag_chats[active_id]["messages"].append({"role": "user", "content": question})
@@ -378,12 +398,14 @@ if active_tab == "ask":
             res_box    = {}
             full_answer = ""
             try:
+                _log.info("[CiteRAG] POST /rag/ask session=%s top_k=15 q=%r", active_id, question[:80])
                 with requests.post(
                     f"{API_URL}/rag/ask",
                     json={"question": question, "session_id": active_id, "top_k": 15, "stream": True},
                     timeout=120, stream=True,
                 ) as resp:
                     resp.raise_for_status()
+                    _log.info("[CiteRAG] streaming started HTTP 200")
 
                     def _token_gen():
                         for line in resp.iter_lines():
@@ -395,6 +417,10 @@ if active_tab == "ask":
                                         _time_mod.sleep(0.008)
                                 elif data.get("type") == "done":
                                     res_box["result"] = data.get("result", {})
+                                    _rd = res_box["result"]
+                                    _log.info("[CiteRAG] stream done tool=%s confidence=%s citations=%d",
+                                              _rd.get("tool_used","?"), _rd.get("confidence","?"),
+                                              len(_rd.get("citations") or []))
 
                     full_answer = stream_placeholder.write_stream(_token_gen())
                     res = res_box.get("result")
@@ -407,9 +433,11 @@ if active_tab == "ask":
                     err = e.response.json().get("detail", "Request rejected by security policy.")
                 except Exception:
                     err = f"API Error: {e.response.status_code}"
+                _log.error("[CiteRAG] HTTP error — %s", err)
                 stream_placeholder.error(f"**Security Alert:** {err}")
                 res = None
             except Exception as e:
+                _log.error("[CiteRAG] connection error — %s", e)
                 stream_placeholder.error(f"**Error:** Could not reach the RAG service. {e}")
                 res = None
 
@@ -425,8 +453,13 @@ if active_tab == "ask":
             st.session_state._last_chunks       = res.get("chunks") or res.get("_raw_chunks", [])
             st.session_state._last_not_found    = (not res.get("chunks") and bool(res.get("_raw_chunks")))
             st.session_state._last_ragas_scores = res.get("ragas_scores")
+            _log.info("[CiteRAG] answer stored — tool=%s confidence=%s citations=%d chunks=%d followups=%d",
+                      ai_msg["tool_used"], ai_msg["confidence"],
+                      len(ai_msg["citations"]), len(st.session_state._last_chunks),
+                      len(ai_msg["followups"]))
         else:
             err = st.session_state.pop("_last_api_error", "Could not reach the RAG service.")
+            _log.warning("[CiteRAG] no result — error: %s", err)
             ai_msg = {"role": "assistant", "content": f"⚠️ **Error:** {err}", "citations": []}
             st.session_state._last_chunks       = []
             st.session_state._last_not_found    = False
@@ -485,12 +518,14 @@ elif active_tab == "library":
         st.markdown("### 📚 Document Library")
     with cb:
         if st.button("↺ Refresh", use_container_width=True):
+            _log.info("[Library] refresh button clicked")
             st.session_state["_library_data"] = None
 
     if st.session_state.get("_library_data") is None:
         with st.spinner("Loading from Notion…"):
             lib = api_get("/library/notion")
         st.session_state["_library_data"] = lib or {}
+        _log.info("[Library] loaded %d docs", len((lib or {}).get("documents", [])))
 
     lib  = st.session_state.get("_library_data", {})
     docs = lib.get("documents", []) if isinstance(lib, dict) else []

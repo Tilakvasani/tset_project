@@ -87,23 +87,45 @@ class _PrettyFormatter(logging.Formatter):
 def _setup_logging():
     """
     Initializes the global logging configuration.
-    
+
     - Sets the log level from settings.
     - Attaches the _PrettyFormatter to the stream handler.
-    - silences noisy third-party libraries (httpx, urllib3, etc.).
+    - Silences noisy third-party libraries (httpx, urllib3, etc.).
     - Configures uvicorn access logs to be less verbose in production.
+
+    CRASH FIX (Windows / Python 3.11 SpawnProcess):
+      We must NOT call logging.basicConfig(force=True) inside a uvicorn
+      spawned sub-process.  force=True replaces ALL existing handlers on the
+      root logger — including the ones uvicorn sets up via dictConfig — which
+      triggers the 'configure_custom' traceback on every hot-reload.
+      Instead we attach our handler only when the root logger has no
+      StreamHandler pointing at stdout yet (first-time setup), and in all
+      other cases we simply set the level and let uvicorn's own handlers
+      remain in place.
     """
     level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
-
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(_PrettyFormatter())
 
     root = logging.getLogger()
     root.setLevel(level)
 
-    # FIX: use force=True instead of root.handlers.clear()
-    # clear() was crashing uvicorn SpawnProcess on Windows (Python 3.11)
-    logging.basicConfig(handlers=[handler], level=level, force=True)
+    # Only add our pretty handler if no stdout StreamHandler exists yet.
+    # This prevents double-printing on reload and avoids the dictConfig crash.
+    already_has_stdout = any(
+        isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is sys.stdout
+        for h in root.handlers
+    )
+    if not already_has_stdout:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(_PrettyFormatter())
+        handler.setLevel(level)
+        root.addHandler(handler)
+    else:
+        # Re-apply our formatter to the existing stdout handler so log style
+        # is consistent even after uvicorn re-installs its own handlers.
+        for h in root.handlers:
+            if isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is sys.stdout:
+                h.setFormatter(_PrettyFormatter())
+                h.setLevel(level)
 
     for noisy in ("httpx", "httpcore", "urllib3", "asyncio", "langsmith"):
         logging.getLogger(noisy).setLevel(logging.WARNING)

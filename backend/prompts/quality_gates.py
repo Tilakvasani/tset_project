@@ -59,4 +59,4 @@ def check_quality(content: str, doc_type: str) -> Tuple[bool, str]:
     if missing:
         return False, f"Missing required sections: {', '.join(missing)}"
 
-    return True, "Quality check passed"
+    return True, "Quality check passed"
