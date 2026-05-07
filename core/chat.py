@@ -15,7 +15,6 @@ class Chat:
     async def run(self, query: str) -> str:
         from core.cli_chat import SYSTEM_PROMPT
         await self._process_query(query)
-
         while True:
             response = self.claude_service.chat(
                 messages=self.messages,
@@ -23,9 +22,10 @@ class Chat:
                 tools=await ToolManager.get_all_tools(self.clients),
             )
             self.claude_service.add_assistant_message(self.messages, response)
-
             if response.stop_reason == "tool_use":
-                print(self.claude_service.text_from_message(response))
+                partial = self.claude_service.text_from_message(response)
+                if partial:
+                    print(partial)
                 tool_results = await ToolManager.execute_tool_requests(self.clients, response)
                 self.claude_service.add_user_message(self.messages, tool_results)
             else:

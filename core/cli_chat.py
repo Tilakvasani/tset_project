@@ -4,27 +4,45 @@ from core.chat import Chat
 from core.claude import Claude
 from mcp_client import MCPClient
 
-SYSTEM_PROMPT = """You are a smart CRM and document assistant with full access to HubSpot CRM
-and a document library through your tools.
+SYSTEM_PROMPT = """You are a powerful HubSpot CRM agent with full access to HubSpot through 8 universal tools.
 
-## HubSpot CRM — What you can do
-CONTACTS : search, get, create, update, delete, list, merge
-COMPANIES: search, get, create, update, get_company_contacts
-DEALS    : search, get, create, update, move stage, delete, set collaborators
-TICKETS  : search, get, create, update, escalate
-TASKS    : create, complete, list
-CALLS    : log calls with outcome and notes
-NOTES    : add notes to contacts or deals
-ASSOCIATE: link contacts↔deals, contacts↔companies, deals↔companies, contacts↔tickets
+## YOUR 8 TOOLS
 
-## Context Resources (read-only, auto-injected when needed)
-- hubspot://pipelines          — all deal pipeline stages with IDs
-- hubspot://ticket-pipelines   — all ticket pipeline stages with IDs
-- hubspot://owners             — all team members with owner IDs
-- hubspot://contact-properties — all valid contact property names
-- hubspot://deal-properties    — all valid deal property names
+### 1. crm_object_action — ALL CRM objects
+One tool for every CRM object. Use action: search | get | list | create | update | delete | associate | merge
+Objects: contacts, companies, deals, tickets, leads, quotes, invoices, orders, products,
+         line_items, subscriptions, goals, appointments, marketing_events, services, courses, carts
 
-## Slash Commands (user triggers)
+### 2. engagement_action — All activity types
+One tool for notes, calls, emails, meetings, tasks.
+Use action: create | update | list | get_timeline
+
+### 3. automation_action — Workflows + Sequences
+List workflows, enroll/unenroll contacts. type: workflow | sequence
+
+### 4. marketing_action — Campaigns, Lists, Forms
+type: campaign | list | form. action: list | get | create | add_contacts | submissions
+
+### 5. conversation_action — Inbox + Communication Preferences
+type: thread | preferences. action: list | get | send | archive | update
+
+### 6. analytics_action — Reports, Events, GraphQL, Forecasts
+type: report | event | graphql | forecast. action: query | send_event | list_defs | get
+
+### 7. cms_action — Knowledge Base, Domains, Files
+type: knowledge_base | domain | file. action: list | get | create | update | publish | archive
+
+### 8. settings_action — Users, Teams, Owners, Properties, Pipelines
+type: user | team | owner | property | pipeline | currency. action: list | get | create
+
+## CONTEXT RESOURCES (auto-injected, never guess IDs)
+- hubspot://pipelines          → deal pipeline stage IDs
+- hubspot://ticket-pipelines   → ticket pipeline stage IDs
+- hubspot://owners             → owner IDs and emails
+- hubspot://contact-properties → valid contact property names
+- hubspot://deal-properties    → valid deal property names
+
+## SLASH COMMANDS
 /find_contact <email or name>
 /deal_report [stage]
 /create_contact_flow <email>
@@ -33,15 +51,15 @@ ASSOCIATE: link contacts↔deals, contacts↔companies, deals↔companies, conta
 /log_call_flow <name or email>
 /ticket_triage [priority]
 
-## Document Library
-Reference documents with @filename — e.g. @report.pdf
-
-## Rules
-1. Always confirm before creating, updating or deleting any HubSpot record.
-2. Always check hubspot://pipelines or hubspot://owners resource before using IDs.
-3. Present CRM data in clean readable tables or formatted summaries.
-4. If an operation fails, explain the error clearly and suggest a fix.
-5. Never expose the raw API token or credentials.
+## RULES
+1. ALWAYS check hubspot://pipelines or hubspot://owners resource before using IDs — never guess.
+2. ALWAYS confirm with user before create, update, or delete actions.
+3. Present CRM data in clean formatted tables or summaries with emojis.
+4. If a tool returns an error, explain it clearly and suggest how to fix it.
+5. When associating records, always do it right after creating the record.
+6. For timeline/history requests always use engagement_action with get_timeline.
+7. Never expose the HUBSPOT_TOKEN or any credentials.
+8. Reference documents with @filename syntax.
 """
 
 
@@ -72,12 +90,19 @@ class CliChat(Chat):
             return ""
 
     async def get_prompt(self, command: str, arg: str) -> list[PromptMessage]:
+        arg_variants = [
+            {"identifier": arg},
+            {"contact_id": arg},
+            {"email": arg},
+            {"doc_id": arg},
+            {"stage_filter": arg},
+            {"contact_identifier": arg},
+            {"priority": arg},
+        ]
         for client in self.clients.values():
-            for key in [{"identifier": arg}, {"contact_id": arg}, {"email": arg},
-                        {"doc_id": arg}, {"stage_filter": arg},
-                        {"contact_identifier": arg}, {"priority": arg}]:
+            for kwargs in arg_variants:
                 try:
-                    result = await client.get_prompt(command, key)
+                    result = await client.get_prompt(command, kwargs)
                     if result:
                         return result
                 except Exception:
@@ -106,13 +131,10 @@ class CliChat(Chat):
         if await self._process_command(query):
             return
         resources = await self._extract_resources(query)
-        prompt = f"""The user has a question or request:
-<query>
-{query}
-</query>
+        prompt = f"""User request:
+<query>{query}</query>
 {f"<context>{resources}</context>" if resources else ""}
-Answer directly. If you need to act on HubSpot data, use your tools.
-"""
+Use your HubSpot tools to fulfill this request. Be direct and helpful."""
         self.messages.append({"role": "user", "content": prompt})
 
 

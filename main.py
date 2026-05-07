@@ -1,6 +1,4 @@
-import asyncio
-import sys
-import os
+import asyncio, sys, os
 from dotenv import load_dotenv
 from contextlib import AsyncExitStack
 
@@ -11,53 +9,51 @@ from core.cli import CliApp
 
 load_dotenv()
 
-# ── Azure OpenAI config ───────────────────────────────────────────────────────
+# ── Azure OpenAI ──────────────────────────────────────────────────────────────
 azure_deployment  = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "")
 azure_api_key     = os.getenv("AZURE_OPENAI_API_KEY", "")
 azure_endpoint    = os.getenv("AZURE_OPENAI_ENDPOINT", "")
-azure_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "")
+azure_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
 
 assert azure_deployment, "AZURE_OPENAI_DEPLOYMENT_NAME missing in .env"
 assert azure_api_key,    "AZURE_OPENAI_API_KEY missing in .env"
 assert azure_endpoint,   "AZURE_OPENAI_ENDPOINT missing in .env"
 
-# ── HubSpot token check (warn but don't crash) ────────────────────────────────
 if not os.getenv("HUBSPOT_TOKEN"):
-    print("⚠️  WARNING: HUBSPOT_TOKEN not set in .env — HubSpot tools will be unavailable\n")
+    print("⚠️  HUBSPOT_TOKEN not set — HubSpot tools will be unavailable\n")
 
 
 async def main():
-    command = ("uv", ["run"]) if os.getenv("USE_UV", "0") == "1" else ("python", [])
+    use_uv = os.getenv("USE_UV", "0") == "1"
+    cmd    = "uv"    if use_uv else "python"
+    prefix = ["run"] if use_uv else []
 
     claude_service = Claude(model=azure_deployment)
 
     async with AsyncExitStack() as stack:
-        # ── Document MCP server (always on) ──────────────────────────────────
-        doc_args = command[1] + ["mcp_server.py"]
+
+        # ── Document MCP server ───────────────────────────────────────────────
         doc_client = await stack.enter_async_context(
-            MCPClient(command=command[0], args=doc_args)
+            MCPClient(command=cmd, args=prefix + ["mcp_server.py"])
         )
-# 
         clients: dict[str, MCPClient] = {"doc_client": doc_client}
 
-        # ── HubSpot MCP server (always on, graceful if token missing) ─────────
-        hs_args = command[1] + ["hubspot_mcp_server.py"]
+        # ── HubSpot MCP server ────────────────────────────────────────────────
         try:
             hs_client = await stack.enter_async_context(
-                MCPClient(command=command[0], args=hs_args)
+                MCPClient(command=cmd, args=prefix + ["hubspot_mcp_server.py"])
             )
             clients["hubspot_client"] = hs_client
         except Exception as e:
-            print(f"⚠️  HubSpot MCP server failed to start: {e}")
+            print(f"⚠️  HubSpot MCP server failed to start: {e}\n")
 
-        # ── Any extra servers passed as CLI args ──────────────────────────────
+        # ── Extra servers from CLI args ───────────────────────────────────────
         for i, script in enumerate(sys.argv[1:]):
             try:
-                extra_args = command[1] + [script]
-                extra_client = await stack.enter_async_context(
-                    MCPClient(command=command[0], args=extra_args)
+                extra = await stack.enter_async_context(
+                    MCPClient(command=cmd, args=prefix + [script])
                 )
-                clients[f"extra_{i}"] = extra_client
+                clients[f"extra_{i}"] = extra
             except Exception as e:
                 print(f"⚠️  Could not start {script}: {e}")
 

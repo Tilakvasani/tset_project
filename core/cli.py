@@ -5,61 +5,69 @@ from prompt_toolkit.styles import Style
 from core.cli_chat import CliChat
 
 BANNER = """
-╔══════════════════════════════════════════════════════════╗
-║           HubSpot CRM Agent  ·  Powered by Azure AI     ║
-╠══════════════════════════════════════════════════════════╣
-║  Connections:                                            ║
-║    📄 Document MCP Server  ✅ connected                  ║
-║    🟠 HubSpot MCP Server   {hs_status}                   ║
-╠══════════════════════════════════════════════════════════╣
-║  Slash commands:                                         ║
-║    /find_contact <email or name>                         ║
-║    /deal_report [stage]                                  ║
-║    /create_contact_flow <email>                          ║
-║    /contact_summary <contact_id>                         ║
-║    /pipeline_overview                                    ║
-║    /log_call_flow <name or email>                        ║
-║    /ticket_triage [priority]                             ║
-║    /summarize <doc_id>  · /rewrite_as_markdown <doc_id>  ║
-╠══════════════════════════════════════════════════════════╣
-║  Reference docs with @filename  ·  Type 'exit' to quit  ║
-╚══════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════╗
+║         HubSpot CRM Agent  ·  Powered by Azure OpenAI       ║
+╠══════════════════════════════════════════════════════════════╣
+║  MCP Connections:                                            ║
+║    📄  Document Server    {doc_status}                       ║
+║    🟠  HubSpot Server     {hs_status}                        ║
+╠══════════════════════════════════════════════════════════════╣
+║  8 Universal Tools:                                          ║
+║    crm_object_action  · engagement_action  · automation_action ║
+║    marketing_action   · conversation_action · analytics_action ║
+║    cms_action         · settings_action                      ║
+╠══════════════════════════════════════════════════════════════╣
+║  Slash Commands:                                             ║
+║    /find_contact <name or email>                             ║
+║    /deal_report [stage]                                      ║
+║    /create_contact_flow <email>                              ║
+║    /contact_summary <contact_id>                             ║
+║    /pipeline_overview                                        ║
+║    /log_call_flow <name or email>                            ║
+║    /ticket_triage [priority]                                 ║
+╠══════════════════════════════════════════════════════════════╣
+║  Reference docs: @filename  ·  Type 'exit' to quit          ║
+╚══════════════════════════════════════════════════════════════╝
 """
 
-STYLE = Style.from_dict({
-    "prompt":   "ansicyan bold",
-    "":         "ansiwhite",
-})
+STYLE = Style.from_dict({"prompt": "ansicyan bold", "": "ansiwhite"})
 
 
 class CliApp:
     def __init__(self, chat: CliChat):
         self.chat = chat
-        self.session: PromptSession = PromptSession(history=InMemoryHistory())
-        self._hs_connected = False
+        self.session = PromptSession(history=InMemoryHistory())
 
     async def initialize(self):
-        """Check connections and print banner."""
-        # Check HubSpot connection
+        doc_ok = False
+        hs_ok  = False
+
+        try:
+            tools = await self.chat.doc_client.list_tools()
+            doc_ok = len(tools) >= 0
+        except Exception:
+            doc_ok = False
+
         try:
             hs_client = self.chat.clients.get("hubspot_client")
             if hs_client:
                 tools = await hs_client.list_tools()
-                self._hs_connected = len(tools) > 0
+                hs_ok = len(tools) > 0
         except Exception:
-            self._hs_connected = False
+            hs_ok = False
 
-        hs_status = "✅ connected" if self._hs_connected else "❌ check HUBSPOT_TOKEN"
-        # Pad to fixed width
-        padding = " " * (14 - len(hs_status.replace("✅ connected","").replace("❌ check HUBSPOT_TOKEN","")))
-        print(BANNER.format(hs_status=hs_status + padding))
+        doc_status = "✅ connected" if doc_ok else "❌ failed   "
+        hs_status  = "✅ connected" if hs_ok  else "❌ check HUBSPOT_TOKEN"
+        print(BANNER.format(doc_status=doc_status, hs_status=hs_status))
+
+        if not hs_ok:
+            print("⚠️  HubSpot tools unavailable — set HUBSPOT_TOKEN in .env\n")
 
     async def run(self):
         while True:
             try:
                 user_input = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self.session.prompt("You ▶ ", style=STYLE)
+                    None, lambda: self.session.prompt("You ▶ ", style=STYLE)
                 )
             except (EOFError, KeyboardInterrupt):
                 print("\nGoodbye! 👋")
