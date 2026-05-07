@@ -1,10 +1,11 @@
 """
 FastAPI routes for the CiteRAG Agent layer.
 
-Handles support ticket lifecycle management (create, list, update)
-and session memory persistence via Redis. Ticket data is stored in
-a dedicated Notion database; the route layer provides both an HTTP
-interface and internal helpers used directly by the agent graph.
+Handles support ticket lifecycle management (create, list, update),
+session memory persistence via Redis, and HubSpot MCP Agent chat.
+Ticket data is stored in a dedicated Notion database; the route layer
+provides both an HTTP interface and internal helpers used directly by
+the agent graph.
 
 Route prefix: /api/agent/
 
@@ -14,7 +15,15 @@ Endpoints:
     POST   /memory           — Save or merge session context into Redis
     POST   /ticket/create    — Create a new Notion support ticket
     DELETE /dedup/flush      — No-op (dedup uses live Notion data)
+    POST   /mcp/chat         — Stream HubSpot MCP agent response
+    POST   /mcp/reset        — Reset MCP conversation history for a session
+    GET    /mcp/status       — Check MCP server connectivity
 """
+
+import os
+import asyncio
+import json as _json
+from contextlib import AsyncExitStack
 
 from datetime import datetime, timezone
 from typing import Optional, List
@@ -22,6 +31,7 @@ import string
 import random
 import httpx as _httpx
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from backend.core.config import settings
@@ -29,6 +39,223 @@ from backend.core.logger import logger
 from backend.services.redis_service import cache
 
 router = APIRouter(prefix="/agent", tags=["Agent"])
+
+# ── MCP session store (in-process, per session_id) ────────────────────────────
+# Maps session_id -> list of OpenAI-format message dicts
+_mcp_sessions: dict[str, list] = {}
+
+
+class MCPChatRequest(BaseModel):
+    session_id: str = "default"
+    message: str
+
+
+class MCPResetRequest(BaseModel):
+    session_id: str = "default"
+
+
+async def _mcp_agent_stream(session_id: str, message: str):
+    """
+    Runs the existing Chat/CliChat/ToolManager loop (no CLI) and yields
+    NDJSON lines so the frontend can stream tokens and tool events.
+    """
+    import sys
+    # Make project root importable (mcp_client, core.*, etc.)
+    _root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
+
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "")
+    azure_api_key    = os.getenv("AZURE_OPENAI_API_KEY", "")
+    azure_endpoint   = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+
+    logger.info("[MCP] ▶ New request | session=%s | msg=%r", session_id, message[:80])
+
+    if not all([azure_deployment, azure_api_key, azure_endpoint]):
+        logger.error("[MCP] ❌ Azure OpenAI credentials missing")
+        yield _json.dumps({"type": "error", "content": "Azure OpenAI credentials not configured."}) + "\n"
+        return
+
+    from mcp_client import MCPClient
+    from core.claude import Claude
+    from core.tools import ToolManager
+    from core.cli_chat import CliChat, SYSTEM_PROMPT
+
+    use_uv     = os.getenv("USE_UV", "0") == "1"
+    cmd        = "uv"    if use_uv else "python"
+    prefix     = ["run"] if use_uv else []
+    mcp_server = os.path.join(_root, "mcp_server.py")
+    hs_server  = os.path.join(_root, "hubspot_mcp_server.py")
+
+    logger.info("[MCP] Launching MCP servers | cmd=%s | doc=%s | hs=%s", cmd, mcp_server, hs_server)
+
+    claude_service = Claude(model=azure_deployment)
+
+    async with AsyncExitStack() as stack:
+        clients: dict[str, MCPClient] = {}
+
+        try:
+            doc_client = await stack.enter_async_context(
+                MCPClient(command=cmd, args=prefix + [mcp_server])
+            )
+            clients["doc_client"] = doc_client
+            logger.info("[MCP] ✅ Document MCP server connected")
+        except Exception as e:
+            logger.warning("[MCP] ⚠️  Doc MCP server unavailable: %s", e)
+
+        try:
+            hs_client = await stack.enter_async_context(
+                MCPClient(command=cmd, args=prefix + [hs_server])
+            )
+            clients["hubspot_client"] = hs_client
+            logger.info("[MCP] ✅ HubSpot MCP server connected")
+        except Exception as e:
+            logger.warning("[MCP] ⚠️  HubSpot MCP server unavailable: %s", e)
+
+        if not clients:
+            logger.error("[MCP] ❌ No MCP servers started — aborting")
+            yield _json.dumps({"type": "error", "content": "No MCP servers could start. Check your .env."}) + "\n"
+            return
+
+        all_tools  = await ToolManager.get_all_tools(clients)
+        tool_names = [t["name"] for t in all_tools]
+        logger.info("[MCP] 🔧 Tools available (%d): %s", len(tool_names), tool_names)
+        yield _json.dumps({"type": "tools", "content": tool_names}) + "\n"
+
+        # Restore history for this session
+        prev_msgs = _mcp_sessions.get(session_id, [])
+        logger.info("[MCP] 📜 Restoring %d previous messages for session=%s", len(prev_msgs), session_id)
+
+        cli_chat = CliChat(
+            doc_client=clients.get("doc_client", next(iter(clients.values()))),
+            clients=clients,
+            claude_service=claude_service,
+        )
+        cli_chat.messages = list(prev_msgs)
+        await cli_chat._process_query(message)
+
+        # ── Agent loop ────────────────────────────────────────────────────────
+        full_response = ""
+        loop_iteration = 0
+        while True:
+            loop_iteration += 1
+            logger.info("[MCP] 🤖 LLM call #%d | messages_in_ctx=%d", loop_iteration, len(cli_chat.messages))
+
+            response = claude_service.chat(
+                messages=cli_chat.messages,
+                system=SYSTEM_PROMPT,
+                tools=all_tools,
+            )
+            claude_service.add_assistant_message(cli_chat.messages, response)
+            logger.info("[MCP] ← stop_reason=%s | content_blocks=%d", response.stop_reason, len(response.content))
+
+            if response.stop_reason == "tool_use":
+                partial = claude_service.text_from_message(response)
+                if partial:
+                    logger.info("[MCP] 💬 Partial text before tool call: %r", partial[:80])
+                    yield _json.dumps({"type": "token", "content": partial}) + "\n"
+
+                for block in response.content:
+                    if block.type == "tool_use":
+                        logger.info("[MCP] 🔧 Tool call → %s | input=%s", block.name, _json.dumps(block.input)[:120])
+                        yield _json.dumps({
+                            "type": "tool_call",
+                            "tool_name": block.name,
+                            "tool_input": block.input,
+                        }) + "\n"
+
+                tool_results = await ToolManager.execute_tool_requests(clients, response)
+
+                for tr in tool_results:
+                    is_err = tr.get("is_error", False)
+                    logger.info("[MCP] %s Tool result | tool_use_id=%s | is_error=%s | content_preview=%r",
+                                "❌" if is_err else "✅",
+                                tr.get("tool_use_id", "?"),
+                                is_err,
+                                str(tr.get("content", ""))[:120])
+                    yield _json.dumps({
+                        "type": "tool_result",
+                        "tool_use_id": tr.get("tool_use_id", ""),
+                        "is_error": is_err,
+                    }) + "\n"
+
+                claude_service.add_user_message(cli_chat.messages, tool_results)
+
+            else:
+                full_response = claude_service.text_from_message(response)
+                logger.info("[MCP] ✅ Final answer | session=%s | len=%d chars | loops=%d",
+                            session_id, len(full_response), loop_iteration)
+                yield _json.dumps({"type": "token", "content": full_response}) + "\n"
+                break
+
+        # Persist history
+        _mcp_sessions[session_id] = list(cli_chat.messages)
+        logger.info("[MCP] 💾 Session history saved | session=%s | total_messages=%d",
+                    session_id, len(cli_chat.messages))
+        yield _json.dumps({"type": "done", "result": {"answer": full_response}}) + "\n"
+
+
+@router.post("/mcp/chat")
+async def mcp_chat(req: MCPChatRequest):
+    """Send a message to the HubSpot MCP agent and stream the NDJSON response."""
+    if not req.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+
+    logger.info("[MCP] POST /mcp/chat | session=%s | message=%r", req.session_id, req.message[:80])
+
+    async def stream():
+        try:
+            async for chunk in _mcp_agent_stream(req.session_id, req.message):
+                yield chunk
+        except Exception as e:
+            logger.error("[MCP] ❌ Stream error | session=%s | error=%s", req.session_id, e, exc_info=True)
+            yield _json.dumps({"type": "error", "content": str(e)}) + "\n"
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+@router.post("/mcp/reset")
+async def mcp_reset(req: MCPResetRequest):
+    """Clear the MCP conversation history for a session."""
+    had_history = req.session_id in _mcp_sessions
+    _mcp_sessions.pop(req.session_id, None)
+    logger.info("[MCP] 🗑 Session reset | session=%s | had_history=%s", req.session_id, had_history)
+    return {"status": "ok", "session_id": req.session_id}
+
+
+@router.get("/mcp/status")
+async def mcp_status():
+    """Check if MCP servers can start and how many tools each exposes."""
+    import sys
+    _root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    use_uv = os.getenv("USE_UV", "0") == "1"
+    cmd    = "uv"    if use_uv else "python"
+    prefix = ["run"] if use_uv else []
+    mcp_server = os.path.join(_root, "mcp_server.py")
+    hs_server  = os.path.join(_root, "hubspot_mcp_server.py")
+
+    from mcp_client import MCPClient
+
+    result = {}
+    async with AsyncExitStack() as stack:
+        for label, path in [("document_server", mcp_server), ("hubspot_server", hs_server)]:
+            try:
+                c = await stack.enter_async_context(
+                    MCPClient(command=cmd, args=prefix + [path])
+                )
+                tools = await c.list_tools()
+                result[label] = {"connected": True, "tool_count": len(tools)}
+            except Exception as e:
+                result[label] = {"connected": False, "error": str(e)}
+    return result
 
 NOTION_API        = "https://api.notion.com/v1"
 NOTION_VER        = "2022-06-28"

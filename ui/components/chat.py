@@ -48,6 +48,184 @@ def _render_ragas_scores(scores: dict, title: str = "", timestamp: str = ""):
         elif avg_vals:
             st.success("All quality metrics look good.")
 
+
+def _is_mcp_query(question: str) -> bool:
+    """Returns True if the question should be routed to the MCP HubSpot agent."""
+    q = question.strip()
+    if q.startswith("/"):
+        return True
+    mcp_keywords = [
+        "hubspot", "contact", "deal", "pipeline", "ticket", "crm",
+        "lead", "company", "engagement", "workflow", "sequence",
+        "owner", "stage", "forecast", "meeting", "call log",
+    ]
+    ql = q.lower()
+    return any(kw in ql for kw in mcp_keywords)
+
+
+def _handle_mcp_turn(active_id: str, question: str):
+    """Sends the question to the MCP agent and streams the response."""
+    collected_tool_calls: list[dict] = []
+    full_answer = ""
+    res_box: dict = {}
+
+    with st.chat_message("assistant", avatar="🤖"):
+        tool_status        = st.empty()
+        stream_placeholder = st.empty()
+
+        try:
+            _log.info("[MCP] POST /agent/mcp/chat | session=%s | q=%r", active_id, question[:80])
+            with requests.post(
+                f"{API_URL}/agent/mcp/chat",
+                json={"session_id": active_id, "message": question},
+                timeout=180, stream=True,
+            ) as resp:
+                resp.raise_for_status()
+
+                def _mcp_gen():
+                    nonlocal full_answer
+                    for line in resp.iter_lines():
+                        if not line:
+                            continue
+                        data  = json.loads(line)
+                        etype = data.get("type")
+
+                        if etype == "tools":
+                            tool_status.caption(
+                                f"🔌 `{'`, `'.join(data['content'][:5])}`"
+                                f"{'…' if len(data['content']) > 5 else ''}"
+                            )
+                        elif etype == "tool_call":
+                            collected_tool_calls.append({
+                                "name":  data["tool_name"],
+                                "input": data.get("tool_input", {}),
+                            })
+                            tool_status.info(f"🔧 Calling `{data['tool_name']}`…")
+                        elif etype == "tool_result":
+                            icon = "❌" if data.get("is_error") else "✅"
+                            tool_status.caption(f"{icon} Tool done — waiting for agent…")
+                        elif etype == "token":
+                            for char in data.get("content", ""):
+                                full_answer += char
+                                yield char
+                                _time_mod.sleep(0.005)
+                        elif etype == "done":
+                            res_box["result"] = data.get("result", {})
+                            tool_status.empty()
+                        elif etype == "error":
+                            tool_status.error(f"❌ {data.get('content', 'Agent error')}")
+
+                stream_placeholder.write_stream(_mcp_gen())
+                if full_answer:
+                    stream_placeholder.markdown(full_answer)
+
+        except requests.exceptions.HTTPError as e:
+            try:
+                err = e.response.json().get("detail", "Agent error.")
+            except Exception:
+                err = f"API Error: {e.response.status_code}"
+            _log.error("[MCP] HTTP error — %s", err)
+            stream_placeholder.error(f"**Error:** {err}")
+        except Exception as e:
+            _log.error("[MCP] connection error — %s", e)
+            stream_placeholder.error(f"**Error:** Could not reach the MCP agent. {e}")
+
+    ai_msg = {
+        "role":       "assistant",
+        "content":    full_answer or res_box.get("result", {}).get("answer", "No response."),
+        "tool_calls": collected_tool_calls,
+        "citations":  [], "confidence": "", "tool_used": "mcp",
+        "agent_reply": "", "followups": [],
+    }
+    st.session_state.rag_chats[active_id]["messages"].append(ai_msg)
+    _log.info("[MCP] answer stored | session=%s | len=%d | tools_used=%d",
+              active_id, len(ai_msg["content"]), len(collected_tool_calls))
+
+
+def _handle_rag_turn(active_id: str, question: str):
+    """Sends the question to the RAG service and streams the response."""
+    ai_msg = {"role": "assistant", "content": "", "citations": [],
+              "confidence": "", "tool_used": "", "agent_reply": "",
+              "followups": [], "tool_calls": []}
+    res = None
+
+    with st.chat_message("assistant", avatar="🤖"):
+        stream_placeholder = st.empty()
+        res_box = {}
+        full_answer = ""
+
+        try:
+            _log.info("[CiteRAG] POST /rag/ask | session=%s | q=%r", active_id, question[:80])
+            with requests.post(
+                f"{API_URL}/rag/ask",
+                json={"question": question, "session_id": active_id, "top_k": 15, "stream": True},
+                timeout=120, stream=True,
+            ) as resp:
+                resp.raise_for_status()
+                _log.info("[CiteRAG] streaming started HTTP 200")
+
+                def _token_gen():
+                    for line in resp.iter_lines():
+                        if line:
+                            data = json.loads(line)
+                            if data.get("type") == "token":
+                                for char in data.get("content", ""):
+                                    yield char
+                                    _time_mod.sleep(0.008)
+                            elif data.get("type") == "done":
+                                res_box["result"] = data.get("result", {})
+                                _rd = res_box["result"]
+                                _log.info("[CiteRAG] stream done tool=%s confidence=%s citations=%d",
+                                          _rd.get("tool_used", "?"), _rd.get("confidence", "?"),
+                                          len(_rd.get("citations") or []))
+
+                full_answer = stream_placeholder.write_stream(_token_gen())
+                res = res_box.get("result")
+                if not full_answer and res:
+                    full_answer = res.get("answer", "")
+                    stream_placeholder.write(full_answer)
+
+        except requests.exceptions.HTTPError as e:
+            try:
+                err = e.response.json().get("detail", "Request rejected by security policy.")
+            except Exception:
+                err = f"API Error: {e.response.status_code}"
+            _log.error("[CiteRAG] HTTP error — %s", err)
+            stream_placeholder.error(f"**Security Alert:** {err}")
+            res = None
+        except Exception as e:
+            _log.error("[CiteRAG] connection error — %s", e)
+            stream_placeholder.error(f"**Error:** Could not reach the RAG service. {e}")
+            res = None
+
+    if res:
+        ai_msg.update({
+            "content":     res.get("answer", full_answer or "No answer returned."),
+            "citations":   res.get("citations", []),
+            "confidence":  res.get("confidence", ""),
+            "tool_used":   res.get("tool_used", ""),
+            "agent_reply": res.get("agent_reply", ""),
+            "followups":   res.get("followups", []),
+        })
+        st.session_state._last_chunks       = res.get("chunks") or res.get("_raw_chunks", [])
+        st.session_state._last_not_found    = (not res.get("chunks") and bool(res.get("_raw_chunks")))
+        st.session_state._last_ragas_scores = res.get("ragas_scores")
+        _log.info("[CiteRAG] answer stored — tool=%s confidence=%s citations=%d chunks=%d followups=%d",
+                  ai_msg["tool_used"], ai_msg["confidence"],
+                  len(ai_msg["citations"]), len(st.session_state._last_chunks),
+                  len(ai_msg["followups"]))
+    else:
+        err = st.session_state.pop("_last_api_error", "Could not reach the RAG service.")
+        _log.warning("[CiteRAG] no result — error: %s", err)
+        ai_msg = {"role": "assistant", "content": f"⚠️ **Error:** {err}",
+                  "citations": [], "tool_calls": []}
+        st.session_state._last_chunks       = []
+        st.session_state._last_not_found    = False
+        st.session_state._last_ragas_scores = None
+
+    st.session_state.rag_chats[active_id]["messages"].append(ai_msg)
+
+
 def render_chat():
     if not st.session_state.rag_chats:
         _c0 = _uuid.uuid4().hex[:8]
@@ -63,13 +241,13 @@ def render_chat():
 
     if not messages:
         st.markdown("## ⚡ CiteRAG Lab")
-        st.caption("Ask questions about your documents · Cite sources · Compare clauses · Analyse risk")
+        st.caption("Ask questions about your documents · Cite sources · Compare clauses · Use `/command` for HubSpot CRM")
         st.divider()
         examples = [
             "What is the notice period in the employment contract?",
             "Compare SOW vs NDA confidentiality clauses",
-            "What are the leave policy details?",
-            "Summarise the HR policies",
+            "/find_contact john@example.com",
+            "/pipeline_overview",
         ]
         c1, c2 = st.columns(2)
         for i, ex in enumerate(examples):
@@ -83,7 +261,17 @@ def render_chat():
         role       = msg["role"]
         text       = msg["content"]
         confidence = msg.get("confidence", "")
+
         with st.chat_message(role):
+            # ── MCP tool calls expander ───────────────────────────────────────
+            tool_calls = msg.get("tool_calls", [])
+            if tool_calls:
+                with st.expander(f"🔧 Used {len(tool_calls)} tool{'s' if len(tool_calls) > 1 else ''}", expanded=False):
+                    for tc in tool_calls:
+                        st.markdown(f"**`{tc['name']}`**")
+                        if tc.get("input"):
+                            st.json(tc["input"], expanded=False)
+
             if role == "assistant" and confidence:
                 conf_icon = "🟢" if confidence == "high" else "🟡" if confidence == "medium" else "🔴"
                 st.caption(f"{conf_icon} CiteRAG  ·  confidence: {confidence}")
@@ -132,91 +320,21 @@ def render_chat():
                                       on_click=set_rag_prefill, args=(fq,))
 
     _prefill = st.session_state.pop("_prefill_q", "")
-    user_q   = st.chat_input("Ask anything about your documents…")
+    user_q   = st.chat_input("Ask about your documents or use /command for HubSpot CRM…")
 
     if user_q or _prefill:
         question = (user_q or _prefill).strip()
-        _log.info("💬 [CiteRAG] User submitted question | session=%s | q=%r", active_id, question)
+        _log.info("💬 User message | session=%s | q=%r | mcp=%s",
+                  active_id, question[:80], _is_mcp_query(question))
         if not messages:
             st.session_state.rag_chats[active_id]["title"] = question[:40] + ("..." if len(question) > 40 else "")
         st.session_state.rag_chats[active_id]["messages"].append({"role": "user", "content": question})
 
-        ai_msg = {"role": "assistant", "content": "", "citations": [],
-                  "confidence": "", "tool_used": "", "agent_reply": "", "followups": []}
-
-        with st.chat_message("assistant", avatar="🤖"):
-            stream_placeholder = st.empty()
-            res_box    = {}
-            full_answer = ""
-            try:
-                _log.info("[CiteRAG] POST /rag/ask session=%s top_k=15 q=%r", active_id, question[:80])
-                with requests.post(
-                    f"{API_URL}/rag/ask",
-                    json={"question": question, "session_id": active_id, "top_k": 15, "stream": True},
-                    timeout=120, stream=True,
-                ) as resp:
-                    resp.raise_for_status()
-                    _log.info("[CiteRAG] streaming started HTTP 200")
-
-                    def _token_gen():
-                        for line in resp.iter_lines():
-                            if line:
-                                data = json.loads(line)
-                                if data.get("type") == "token":
-                                    for char in data.get("content", ""):
-                                        yield char
-                                        _time_mod.sleep(0.008)
-                                elif data.get("type") == "done":
-                                    res_box["result"] = data.get("result", {})
-                                    _rd = res_box["result"]
-                                    _log.info("[CiteRAG] stream done tool=%s confidence=%s citations=%d",
-                                              _rd.get("tool_used","?"), _rd.get("confidence","?"),
-                                              len(_rd.get("citations") or []))
-
-                    full_answer = stream_placeholder.write_stream(_token_gen())
-                    res = res_box.get("result")
-                    if not full_answer and res:
-                        full_answer = res.get("answer", "")
-                        stream_placeholder.write(full_answer)
-
-            except requests.exceptions.HTTPError as e:
-                try:
-                    err = e.response.json().get("detail", "Request rejected by security policy.")
-                except Exception:
-                    err = f"API Error: {e.response.status_code}"
-                _log.error("[CiteRAG] HTTP error — %s", err)
-                stream_placeholder.error(f"**Security Alert:** {err}")
-                res = None
-            except Exception as e:
-                _log.error("[CiteRAG] connection error — %s", e)
-                stream_placeholder.error(f"**Error:** Could not reach the RAG service. {e}")
-                res = None
-
-        if res:
-            ai_msg.update({
-                "content":     res.get("answer", full_answer or "No answer returned."),
-                "citations":   res.get("citations", []),
-                "confidence":  res.get("confidence", ""),
-                "tool_used":   res.get("tool_used", ""),
-                "agent_reply": res.get("agent_reply", ""),
-                "followups":   res.get("followups", []),
-            })
-            st.session_state._last_chunks       = res.get("chunks") or res.get("_raw_chunks", [])
-            st.session_state._last_not_found    = (not res.get("chunks") and bool(res.get("_raw_chunks")))
-            st.session_state._last_ragas_scores = res.get("ragas_scores")
-            _log.info("[CiteRAG] answer stored — tool=%s confidence=%s citations=%d chunks=%d followups=%d",
-                      ai_msg["tool_used"], ai_msg["confidence"],
-                      len(ai_msg["citations"]), len(st.session_state._last_chunks),
-                      len(ai_msg["followups"]))
+        if _is_mcp_query(question):
+            _handle_mcp_turn(active_id, question)
         else:
-            err = st.session_state.pop("_last_api_error", "Could not reach the RAG service.")
-            _log.warning("[CiteRAG] no result — error: %s", err)
-            ai_msg = {"role": "assistant", "content": f"⚠️ **Error:** {err}", "citations": []}
-            st.session_state._last_chunks       = []
-            st.session_state._last_not_found    = False
-            st.session_state._last_ragas_scores = None
+            _handle_rag_turn(active_id, question)
 
-        st.session_state.rag_chats[active_id]["messages"].append(ai_msg)
         st.rerun()
 
     chunks    = st.session_state.get("_last_chunks", [])
